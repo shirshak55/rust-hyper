@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
 
 #[cfg(feature = "client")]
@@ -7,8 +8,6 @@ use bytes::Bytes;
 use bytes::BytesMut;
 #[cfg(feature = "client")]
 use http::header::Entry;
-#[cfg(feature = "server")]
-use http::header::ValueIter;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode, Version};
 use smallvec::{smallvec, smallvec_inline, SmallVec};
@@ -17,9 +16,7 @@ use crate::body::DecodedLength;
 #[cfg(feature = "server")]
 use crate::common::date;
 use crate::error::Parse;
-use crate::ext::HeaderCaseMap;
-#[cfg(feature = "ffi")]
-use crate::ext::OriginalHeaderOrder;
+use crate::ext::{HeaderCaseMap, OriginalHeaderOrder};
 use crate::headers;
 use crate::proto::h1::{
     Encode, Encoder, Http1Transaction, ParseContext, ParseResult, ParsedMessage,
@@ -220,8 +217,16 @@ impl Http1Transaction for Server {
         let slice = buf.split_to(len).freeze();
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
-            // TODO(lucab): switch to `Uri::from_shared()` once public.
-            http::Uri::from_maybe_shared(uri_bytes)?
+            if uri_bytes.is_ascii() {
+                // TODO(lucab): switch to `Uri::from_shared()` once public.
+                http::Uri::from_maybe_shared(uri_bytes)?
+            } else {
+                // A request-target carrying raw non-ASCII bytes (`/caf\xc3\xa9`) is
+                // malformed, but hand-rolled clients send it and origins accept
+                // it. `Uri` can't hold those bytes, so percent-encode them
+                // instead of answering 400.
+                http::Uri::from_maybe_shared(percent_encode_non_ascii(&uri_bytes))?
+            }
         };
         subject = RequestLine(method, uri);
 
@@ -247,8 +252,6 @@ impl Http1Transaction for Server {
         } else {
             None
         };
-
-        #[cfg(feature = "ffi")]
         let mut header_order = if ctx.preserve_header_order {
             Some(OriginalHeaderOrder::default())
         } else {
@@ -334,8 +337,6 @@ impl Http1Transaction for Server {
             if let Some(header_case_map) = &mut header_case_map {
                 header_case_map.append(&name, slice.slice(header.name.0..header.name.1));
             }
-
-            #[cfg(feature = "ffi")]
             if let Some(header_order) = &mut header_order {
                 header_order.append(&name);
             }
@@ -357,8 +358,6 @@ impl Http1Transaction for Server {
         if let Some(header_case_map) = header_case_map {
             extensions.insert(header_case_map);
         }
-
-        #[cfg(feature = "ffi")]
         if let Some(header_order) = header_order {
             extensions.insert(header_order);
         }
@@ -465,6 +464,7 @@ impl Http1Transaction for Server {
             }
             orig_headers => orig_headers,
         };
+        let order = extensions.get::<OriginalHeaderOrder>();
         let encoder = if let Some(orig_headers) = orig_headers {
             Self::encode_headers_with_original_case(
                 msg,
@@ -473,9 +473,10 @@ impl Http1Transaction for Server {
                 orig_len,
                 wrote_len,
                 orig_headers,
+                order,
             )?
         } else {
-            Self::encode_headers_with_lower_case(msg, dst, is_last, orig_len, wrote_len)?
+            Self::encode_headers_with_lower_case(msg, dst, is_last, orig_len, wrote_len, order)?
         };
 
         ret.map(|()| encoder)
@@ -545,6 +546,7 @@ impl Server {
         is_last: bool,
         orig_len: usize,
         wrote_len: bool,
+        order: Option<&OriginalHeaderOrder>,
     ) -> crate::Result<Encoder> {
         struct LowercaseWriter;
 
@@ -575,7 +577,7 @@ impl Server {
             }
         }
 
-        Self::encode_headers(msg, dst, is_last, orig_len, wrote_len, LowercaseWriter)
+        Self::encode_headers(msg, dst, is_last, orig_len, wrote_len, LowercaseWriter, order)
     }
 
     #[cold]
@@ -587,10 +589,15 @@ impl Server {
         orig_len: usize,
         wrote_len: bool,
         orig_headers: &HeaderCaseMap,
+        order: Option<&OriginalHeaderOrder>,
     ) -> crate::Result<Encoder> {
         struct OrigCaseWriter<'map> {
             map: &'map HeaderCaseMap,
-            current: Option<(HeaderName, ValueIter<'map, Bytes>)>,
+            // How many values of each name were written so far: the n-th written
+            // value of a name takes the n-th recorded spelling, which stays right
+            // when repeated names are interleaved (original order) rather than
+            // grouped.
+            written: HashMap<HeaderName, usize>,
             title_case_headers: bool,
         }
 
@@ -621,16 +628,14 @@ impl Server {
             fn write_header_name(&mut self, dst: &mut Vec<u8>, name: &HeaderName) {
                 let Self {
                     map,
-                    current,
+                    written,
                     title_case_headers,
                 } = self;
-                if current.as_ref().map_or(true, |(last, _)| last != name) {
-                    *current = None;
-                }
-                let (_, values) =
-                    current.get_or_insert_with(|| (name.clone(), map.get_all_internal(name)));
+                let nth = written.entry(name.clone()).or_insert(0);
+                let orig_name = map.get_all_internal(name).nth(*nth);
+                *nth += 1;
 
-                if let Some(orig_name) = values.next() {
+                if let Some(orig_name) = orig_name {
                     extend(dst, orig_name);
                 } else if *title_case_headers {
                     title_case(dst, name.as_str().as_bytes());
@@ -642,11 +647,11 @@ impl Server {
 
         let header_name_writer = OrigCaseWriter {
             map: orig_headers,
-            current: None,
+            written: HashMap::new(),
             title_case_headers: msg.title_case_headers,
         };
 
-        Self::encode_headers(msg, dst, is_last, orig_len, wrote_len, header_name_writer)
+        Self::encode_headers(msg, dst, is_last, orig_len, wrote_len, header_name_writer, order)
     }
 
     #[inline]
@@ -657,6 +662,7 @@ impl Server {
         orig_len: usize,
         mut wrote_len: bool,
         mut header_name_writer: W,
+        order: Option<&OriginalHeaderOrder>,
     ) -> crate::Result<Encoder>
     where
         W: HeaderNameWriter,
@@ -695,7 +701,25 @@ impl Server {
             }};
         }
 
-        'headers: for (opt_name, value) in msg.head.headers.drain() {
+        // `(Some(name), value)` marks a name change, like `HeaderMap::drain`; with a
+        // recorded order, entries come back interleaved as originally received.
+        let entries: Vec<(Option<HeaderName>, HeaderValue)> = match order {
+            Some(order) => {
+                let mut prev: Option<HeaderName> = None;
+                let entries = order.entries(&msg.head.headers)
+                    .into_iter()
+                    .map(|(name, _, value)| {
+                        let changed = prev.as_ref() != Some(&name);
+                        prev = Some(name.clone());
+                        (changed.then_some(name), value)
+                    })
+                    .collect();
+                msg.head.headers.clear();
+                entries
+            }
+            None => msg.head.headers.drain().collect(),
+        };
+        'headers: for (opt_name, value) in entries {
             if let Some(n) = opt_name {
                 cur_name = Some(n);
                 handle_is_name_written!();
@@ -1107,8 +1131,6 @@ impl Http1Transaction for Client {
             } else {
                 None
             };
-
-            #[cfg(feature = "ffi")]
             let mut header_order = if ctx.preserve_header_order {
                 Some(OriginalHeaderOrder::default())
             } else {
@@ -1136,8 +1158,6 @@ impl Http1Transaction for Client {
                 if let Some(header_case_map) = &mut header_case_map {
                     header_case_map.append(&name, slice.slice(header.name.0..header.name.1));
                 }
-
-                #[cfg(feature = "ffi")]
                 if let Some(header_order) = &mut header_order {
                     header_order.append(&name);
                 }
@@ -1150,8 +1170,6 @@ impl Http1Transaction for Client {
             if let Some(header_case_map) = header_case_map {
                 extensions.insert(header_case_map);
             }
-
-            #[cfg(feature = "ffi")]
             if let Some(header_order) = header_order {
                 extensions.insert(header_order);
             }
@@ -1225,18 +1243,12 @@ impl Http1Transaction for Client {
         }
         extend(dst, b"\r\n");
 
-        if let Some(orig_headers) = msg.head.extensions.get::<HeaderCaseMap>() {
-            write_headers_original_case(
-                &msg.head.headers,
-                orig_headers,
-                dst,
-                msg.title_case_headers,
-            );
-        } else if msg.title_case_headers {
-            write_headers_title_case(&msg.head.headers, dst);
-        } else {
-            write_headers(&msg.head.headers, dst);
-        }
+        write_message_headers(
+            &msg.head.headers,
+            &msg.head.extensions,
+            dst,
+            msg.title_case_headers,
+        );
 
         extend(dst, b"\r\n");
         msg.head.headers.clear(); //TODO: remove when switching to drain()
@@ -1614,8 +1626,85 @@ pub(crate) fn write_headers(headers: &HeaderMap, dst: &mut Vec<u8>) {
     }
 }
 
+/// Writes an interim (1xx) response head: status line, its headers (original
+/// order and spelling when recorded), and the terminating blank line.
+#[cfg(feature = "server")]
+pub(crate) fn encode_informational(
+    head: &MessageHead<StatusCode>,
+    dst: &mut Vec<u8>,
+    title_case_headers: bool,
+) {
+    extend(dst, b"HTTP/1.1 ");
+    extend(dst, head.subject.as_str().as_bytes());
+    extend(dst, b" ");
+    match head.extensions.get::<crate::ext::ReasonPhrase>() {
+        Some(reason) => extend(dst, reason.as_bytes()),
+        None => extend(
+            dst,
+            head.subject.canonical_reason().unwrap_or("<none>").as_bytes(),
+        ),
+    }
+    extend(dst, b"\r\n");
+    write_message_headers(&head.headers, &head.extensions, dst, title_case_headers);
+    extend(dst, b"\r\n");
+}
+
+/// Percent-encodes every non-ASCII byte of a request-target so `http::Uri` can
+/// represent it; ASCII bytes are copied through untouched.
+#[cfg(feature = "server")]
+fn percent_encode_non_ascii(raw: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(raw.len() + 8);
+    for &b in raw {
+        if b.is_ascii() {
+            out.push(b);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.extend_from_slice(&[b'%', HEX[(b >> 4) as usize], HEX[(b & 0xF) as usize]]);
+        }
+    }
+    Bytes::from(out)
+}
+
+/// Writes `Name: value` lines honoring the recorded original order and spelling
+/// when the message carries them, else title-case or lowercase.
+fn write_message_headers(
+    headers: &HeaderMap,
+    extensions: &http::Extensions,
+    dst: &mut Vec<u8>,
+    title_case_headers: bool,
+) {
+    let orig_case = extensions.get::<HeaderCaseMap>();
+    if let Some(order) = extensions.get::<OriginalHeaderOrder>() {
+        for (name, nth, value) in order.entries(headers) {
+            match orig_case.and_then(|map| map.get_all(&name).nth(nth)) {
+                Some(orig_name) => extend(dst, orig_name),
+                None if title_case_headers => title_case(dst, name.as_str().as_bytes()),
+                None => extend(dst, name.as_str().as_bytes()),
+            }
+            write_header_value_line(dst, &value);
+        }
+    } else if let Some(orig_case) = orig_case {
+        write_headers_original_case(headers, orig_case, dst, title_case_headers);
+    } else if title_case_headers {
+        write_headers_title_case(headers, dst);
+    } else {
+        write_headers(headers, dst);
+    }
+}
+
+#[inline]
+fn write_header_value_line(dst: &mut Vec<u8>, value: &HeaderValue) {
+    // Wanted for curl test cases that send `X-Custom-Header:\r\n`
+    if value.is_empty() {
+        extend(dst, b":\r\n");
+    } else {
+        extend(dst, b": ");
+        extend(dst, value.as_bytes());
+        extend(dst, b"\r\n");
+    }
+}
+
 #[cold]
-#[cfg(feature = "client")]
 fn write_headers_original_case(
     headers: &HeaderMap,
     orig_case: &HeaderCaseMap,
@@ -1693,7 +1782,6 @@ mod tests {
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 preserve_header_case: false,
-                #[cfg(feature = "ffi")]
                 preserve_header_order: false,
                 h09_responses: false,
                 #[cfg(feature = "client")]
@@ -1721,7 +1809,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1745,7 +1832,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1766,7 +1852,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: true,
             #[cfg(feature = "client")]
@@ -1789,7 +1874,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1816,7 +1900,6 @@ mod tests {
             h1_parser_config,
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1840,7 +1923,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1868,7 +1950,6 @@ mod tests {
             h1_parser_config,
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1895,7 +1976,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: false,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1915,7 +1995,6 @@ mod tests {
             h1_parser_config: Default::default(),
             h1_max_headers: None,
             preserve_header_case: true,
-            #[cfg(feature = "ffi")]
             preserve_header_order: false,
             h09_responses: false,
             #[cfg(feature = "client")]
@@ -1954,7 +2033,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]
@@ -1975,7 +2053,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]
@@ -2215,7 +2292,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]
@@ -2236,7 +2312,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]
@@ -2257,7 +2332,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]
@@ -2827,7 +2901,6 @@ mod tests {
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 preserve_header_case: false,
-                #[cfg(feature = "ffi")]
                 preserve_header_order: false,
                 h09_responses: false,
                 #[cfg(feature = "client")]
@@ -2871,7 +2944,6 @@ mod tests {
                         h1_parser_config: Default::default(),
                         h1_max_headers: max_headers,
                         preserve_header_case: false,
-                        #[cfg(feature = "ffi")]
                         preserve_header_order: false,
                         h09_responses: false,
                         #[cfg(feature = "client")]
@@ -2895,7 +2967,6 @@ mod tests {
                         h1_parser_config: Default::default(),
                         h1_max_headers: max_headers,
                         preserve_header_case: false,
-                        #[cfg(feature = "ffi")]
                         preserve_header_order: false,
                         h09_responses: false,
                         #[cfg(feature = "client")]
@@ -3015,7 +3086,6 @@ mod tests {
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 preserve_header_case: false,
-                #[cfg(feature = "ffi")]
                 preserve_header_order: false,
                 h09_responses: false,
                 #[cfg(feature = "client")]
@@ -3098,7 +3168,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]
@@ -3143,7 +3212,6 @@ mod tests {
                     h1_parser_config: Default::default(),
                     h1_max_headers: None,
                     preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: false,
                     h09_responses: false,
                     #[cfg(feature = "client")]

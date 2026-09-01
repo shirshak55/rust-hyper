@@ -189,7 +189,6 @@ where
                     h1_parser_config: parse_ctx.h1_parser_config.clone(),
                     h1_max_headers: parse_ctx.h1_max_headers,
                     preserve_header_case: parse_ctx.preserve_header_case,
-                    #[cfg(feature = "ffi")]
                     preserve_header_order: parse_ctx.preserve_header_order,
                     h09_responses: parse_ctx.h09_responses,
                     #[cfg(feature = "client")]
@@ -703,7 +702,6 @@ mod tests {
                 h1_parser_config: Default::default(),
                 h1_max_headers: None,
                 preserve_header_case: false,
-                #[cfg(feature = "ffi")]
                 preserve_header_order: false,
                 h09_responses: false,
                 #[cfg(feature = "client")]

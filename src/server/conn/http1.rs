@@ -76,6 +76,8 @@ pub struct Builder {
     h1_keep_alive: bool,
     h1_title_case_headers: bool,
     h1_preserve_header_case: bool,
+    h1_informational: bool,
+    h1_permissive_trailers: bool,
     h1_max_headers: Option<usize>,
     h1_header_read_timeout: Dur,
     h1_writev: Option<bool>,
@@ -246,6 +248,8 @@ impl Builder {
             h1_keep_alive: true,
             h1_title_case_headers: false,
             h1_preserve_header_case: false,
+            h1_informational: false,
+            h1_permissive_trailers: false,
             h1_max_headers: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
             h1_writev: None,
@@ -319,6 +323,29 @@ impl Builder {
     /// Default is `false`.
     pub fn preserve_header_case(&mut self, enabled: bool) -> &mut Self {
         self.h1_preserve_header_case = enabled;
+        self
+    }
+
+    /// Set whether services may relay interim (1xx) responses.
+    ///
+    /// When enabled, every request carries an
+    /// [`InformationalSender`](crate::ext::InformationalSender) extension; each
+    /// head sent through it is written to the client immediately, ahead of the
+    /// service's final response.
+    ///
+    /// Default is false.
+    pub fn informational_responses(&mut self, enabled: bool) -> &mut Self {
+        self.h1_informational = enabled;
+        self
+    }
+
+    /// Set whether chunked trailer fields are written exactly as the body
+    /// provides them: without requiring the client's `TE: trailers`, and without
+    /// requiring a `Trailer` header that lists them.
+    ///
+    /// Default is false (RFC 9110 behavior).
+    pub fn permissive_trailers(&mut self, enabled: bool) -> &mut Self {
+        self.h1_permissive_trailers = enabled;
         self
     }
 
@@ -472,6 +499,9 @@ impl Builder {
         if self.h1_preserve_header_case {
             conn.set_preserve_header_case();
         }
+        if self.h1_permissive_trailers {
+            conn.set_permissive_trailers();
+        }
         if let Some(max_headers) = self.h1_max_headers {
             conn.set_http1_max_headers(max_headers);
         }
@@ -495,7 +525,10 @@ impl Builder {
         if !self.date_header {
             conn.disable_date_header();
         }
-        let sd = proto::h1::dispatch::Server::new(service);
+        let mut sd = proto::h1::dispatch::Server::new(service);
+        if self.h1_informational {
+            sd.relay_informational();
+        }
         let proto = proto::h1::Dispatcher::new(sd, conn);
         Connection { conn: proto }
     }

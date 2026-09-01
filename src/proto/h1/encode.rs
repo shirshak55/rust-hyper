@@ -160,15 +160,23 @@ impl Encoder {
         EncodedBuf { kind }
     }
 
+    /// Encodes the chunked-body trailer section. Only fields listed in the
+    /// response's `Trailer` header are written, unless `permissive` is set, in
+    /// which case every valid trailer field is written as given.
     pub(crate) fn encode_trailers<B>(
         &self,
         trailers: HeaderMap,
         title_case_headers: bool,
+        permissive: bool,
     ) -> Option<EncodedBuf<B>> {
         trace!("encoding trailers");
         match &self.kind {
-            Kind::Chunked(Some(allowed_trailer_fields)) => {
-                let allowed_set: HashSet<&HeaderName> = allowed_trailer_fields.iter().collect();
+            Kind::Chunked(allowed_trailer_fields)
+                if permissive || allowed_trailer_fields.is_some() =>
+            {
+                let allowed_set: Option<HashSet<&HeaderName>> = allowed_trailer_fields
+                    .as_ref()
+                    .map(|fields| fields.iter().collect());
 
                 let mut cur_name = None;
                 let mut allowed_trailers = HeaderMap::new();
@@ -179,7 +187,7 @@ impl Encoder {
                     }
                     let name = cur_name.as_ref().expect("current header name");
 
-                    if allowed_set.contains(name) {
+                    if allowed_set.as_ref().map_or(true, |set| set.contains(name)) {
                         if is_valid_trailer_field(name) {
                             allowed_trailers.append(name, value);
                         } else {
@@ -530,7 +538,7 @@ mod tests {
             ),
         ]);
 
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false).unwrap();
+        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -557,7 +565,7 @@ mod tests {
             ),
         ]);
 
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false).unwrap();
+        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -583,7 +591,7 @@ mod tests {
             HeaderValue::from_static("second"),
         );
 
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false).unwrap();
+        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -603,13 +611,13 @@ mod tests {
         )]);
 
         assert!(encoder
-            .encode_trailers::<&[u8]>(headers.clone(), false)
+            .encode_trailers::<&[u8]>(headers.clone(), false, false)
             .is_none());
 
         let trailers = vec![];
         let encoder = encoder.into_chunked_with_trailing_fields(trailers);
 
-        assert!(encoder.encode_trailers::<&[u8]>(headers, false).is_none());
+        assert!(encoder.encode_trailers::<&[u8]>(headers, false, false).is_none());
     }
 
     #[test]
@@ -646,7 +654,7 @@ mod tests {
         headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("header data"));
         headers.insert(TE, HeaderValue::from_static("header data"));
 
-        assert!(encoder.encode_trailers::<&[u8]>(headers, true).is_none());
+        assert!(encoder.encode_trailers::<&[u8]>(headers, true, false).is_none());
     }
 
     #[test]
@@ -659,7 +667,7 @@ mod tests {
             HeaderName::from_static("chunky-trailer"),
             HeaderValue::from_static("header data"),
         )]);
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, true).unwrap();
+        let buf1 = encoder.encode_trailers::<&[u8]>(headers, true, false).unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -690,7 +698,7 @@ mod tests {
             HeaderValue::from_static("trailer value"),
         )]);
 
-        let buf = encoder.encode_trailers::<&[u8]>(headers, false).unwrap();
+        let buf = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
         let mut dst = Vec::new();
         dst.put(buf);
         assert_eq!(dst, b"0\r\nchunky-trailer: trailer value\r\n\r\n");

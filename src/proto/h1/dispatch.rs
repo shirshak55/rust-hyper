@@ -40,6 +40,18 @@ pub(crate) trait Dispatch {
         -> crate::Result<()>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
     fn should_poll(&self) -> bool;
+    /// Interim (1xx) heads the service asked to send ahead of its final
+    /// response (server only).
+    #[cfg(feature = "server")]
+    fn poll_informational(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<MessageHead<http::StatusCode>>> {
+        Poll::Ready(None)
+    }
+    /// The final head is being written; later interim sends are dropped.
+    #[cfg(feature = "server")]
+    fn finish_informational(&mut self) {}
 }
 
 cfg_server! {
@@ -48,6 +60,8 @@ cfg_server! {
     pub(crate) struct Server<S: HttpService<B>, B> {
         in_flight: Pin<Box<Option<S::Future>>>,
         pub(crate) service: S,
+        relay_informational: bool,
+        informational: Option<crate::ext::InformationalReceiver>,
     }
 }
 
@@ -361,8 +375,17 @@ where
                 && self.conn.can_write_head()
                 && self.dispatch.should_poll()
             {
+                #[cfg(feature = "server")]
+                self.write_informational(cx);
                 if let Some(msg) = ready!(Pin::new(&mut self.dispatch).poll_msg(cx)) {
                     let (head, body) = msg.map_err(crate::Error::new_user_service)?;
+                    // Interim heads sent in the same poll that produced the final
+                    // response must still go out first.
+                    #[cfg(feature = "server")]
+                    {
+                        self.write_informational(cx);
+                        self.dispatch.finish_informational();
+                    }
 
                     let body_type = if body.is_end_stream() {
                         self.body_rx.set(None);
@@ -444,6 +467,14 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Writes every interim (1xx) head the service has queued so far.
+    #[cfg(feature = "server")]
+    fn write_informational(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some(head)) = self.dispatch.poll_informational(cx) {
+            self.conn.write_informational(head);
         }
     }
 
@@ -572,7 +603,15 @@ cfg_server! {
             Server {
                 in_flight: Box::pin(None),
                 service,
+                relay_informational: false,
+                informational: None,
             }
+        }
+
+        /// Hands each request an `InformationalSender` so the service can
+        /// relay interim (1xx) heads.
+        pub(crate) fn relay_informational(&mut self) {
+            self.relay_informational = true;
         }
 
         pub(crate) fn into_service(self) -> S {
@@ -626,9 +665,38 @@ cfg_server! {
             *req.headers_mut() = msg.headers;
             *req.version_mut() = msg.version;
             *req.extensions_mut() = msg.extensions;
+            if self.relay_informational {
+                let (tx, rx) = crate::ext::informational_channel();
+                req.extensions_mut().insert(tx);
+                self.informational = Some(rx);
+            }
             let fut = self.service.call(req);
             self.in_flight.set(Some(fut));
             Ok(())
+        }
+
+        fn poll_informational(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<MessageHead<http::StatusCode>>> {
+            let Some(rx) = self.informational.as_mut() else {
+                return Poll::Ready(None);
+            };
+            rx.poll_recv(cx).map(|res| {
+                res.map(|res| {
+                    let (parts, ()) = res.into_parts();
+                    MessageHead {
+                        version: parts.version,
+                        subject: parts.status,
+                        headers: parts.headers,
+                        extensions: parts.extensions,
+                    }
+                })
+            })
+        }
+
+        fn finish_informational(&mut self) {
+            self.informational = None;
         }
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {

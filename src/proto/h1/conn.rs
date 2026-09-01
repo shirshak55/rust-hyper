@@ -69,7 +69,6 @@ where
                 #[cfg(feature = "server")]
                 timer: Time::Empty,
                 preserve_header_case: false,
-                #[cfg(feature = "ffi")]
                 preserve_header_order: false,
                 title_case_headers: false,
                 h09_responses: false,
@@ -83,6 +82,7 @@ where
                 // If they tell us otherwise, we'll downgrade in `read_head`.
                 version: Version::HTTP_11,
                 allow_trailer_fields: false,
+                permissive_trailers: false,
             },
             _marker: PhantomData,
         }
@@ -123,11 +123,19 @@ where
         self.state.title_case_headers = true;
     }
 
+    /// Preserves both the original spelling *and* the original order of headers
+    /// (repeated names interleaved as received): both are what "as received"
+    /// means for a proxy, and the widely used builders only expose this switch.
     pub(crate) fn set_preserve_header_case(&mut self) {
         self.state.preserve_header_case = true;
+        self.state.preserve_header_order = true;
     }
 
-    #[cfg(feature = "ffi")]
+    #[cfg(feature = "server")]
+    pub(crate) fn set_permissive_trailers(&mut self) {
+        self.state.permissive_trailers = true;
+    }
+    #[cfg(feature = "client")]
     pub(crate) fn set_preserve_header_order(&mut self) {
         self.state.preserve_header_order = true;
     }
@@ -242,7 +250,6 @@ where
                 h1_parser_config: self.state.h1_parser_config.clone(),
                 h1_max_headers: self.state.h1_max_headers,
                 preserve_header_case: self.state.preserve_header_case,
-                #[cfg(feature = "ffi")]
                 preserve_header_order: self.state.preserve_header_order,
                 h09_responses: self.state.h09_responses,
                 #[cfg(feature = "client")]
@@ -593,6 +600,19 @@ where
         self.io.has_buffered_write()
     }
 
+    /// Writes an interim (1xx) response head ahead of the final head. Dropped
+    /// when the connection can't write a head right now (a head is already in
+    /// progress, or the write buffer is backed up).
+    #[cfg(feature = "server")]
+    pub(crate) fn write_informational(&mut self, head: MessageHead<http::StatusCode>) {
+        if !self.can_write_head() {
+            debug!("dropping informational response: cannot write a head now");
+            return;
+        }
+        let buf = self.io.headers_buf();
+        super::role::encode_informational(&head, buf, self.state.title_case_headers);
+    }
+
     pub(crate) fn write_head(&mut self, head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
         if let Some(encoder) = self.encode_head(head, body) {
             self.state.writing = if !encoder.is_eof() {
@@ -737,7 +757,8 @@ where
     }
 
     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) {
-        if T::is_server() && !self.state.allow_trailer_fields {
+        if T::is_server() && !self.state.allow_trailer_fields && !self.state.permissive_trailers
+        {
             debug!("trailers not allowed to be sent");
             return;
         }
@@ -746,7 +767,11 @@ where
         match &mut self.state.writing {
             Writing::Body(encoder) => {
                 if let Some(enc_buf) =
-                    encoder.encode_trailers(trailers, self.state.title_case_headers)
+                    encoder.encode_trailers(
+                        trailers,
+                        self.state.title_case_headers,
+                        self.state.permissive_trailers,
+                    )
                 {
                     self.io.buffer(enc_buf);
 
@@ -946,7 +971,6 @@ struct State {
     #[cfg(feature = "server")]
     timer: Time,
     preserve_header_case: bool,
-    #[cfg(feature = "ffi")]
     preserve_header_order: bool,
     title_case_headers: bool,
     h09_responses: bool,
@@ -968,6 +992,9 @@ struct State {
     version: Version,
     /// Flag to track if trailer fields are allowed to be sent.
     allow_trailer_fields: bool,
+    /// Write chunked trailers as given: without the client's `TE: trailers` and
+    /// without a `Trailer` declaration listing them.
+    permissive_trailers: bool,
 }
 
 #[derive(Debug)]

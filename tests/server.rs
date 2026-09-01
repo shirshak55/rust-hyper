@@ -1492,6 +1492,155 @@ async fn returning_1xx_response_is_error() {
         .expect_err("1xx status code should error");
 }
 
+#[tokio::test]
+async fn http1_informational_responses_are_relayed() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let client = thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let res = read_until(&mut tcp, |buf| buf.ends_with(b"ok")).expect("reading");
+        let expected = "HTTP/1.1 103 Early Hints\r\nlink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\n";
+        assert_eq!(&s(&res)[..expected.len()], expected);
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    http1::Builder::new()
+        .informational_responses(true)
+        .serve_connection(
+            TokioIo::new(socket),
+            service_fn(|req: Request<IncomingBody>| async move {
+                let sender = req
+                    .extensions()
+                    .get::<hyper::ext::InformationalSender>()
+                    .expect("InformationalSender extension");
+                let hints = Response::builder()
+                    .status(StatusCode::EARLY_HINTS)
+                    .header("link", "</style.css>; rel=preload")
+                    .body(())
+                    .unwrap();
+                sender.send(hints).expect("send 103");
+                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("ok"))))
+            }),
+        )
+        .await
+        .unwrap();
+    client.join().unwrap();
+}
+
+#[tokio::test]
+async fn http1_permissive_trailers_without_te_or_trailer_header() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let client = thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        // No `TE: trailers`.
+        tcp.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let res = read_until(&mut tcp, |buf| {
+            buf.ends_with(b"\r\n\r\n0\r\n") || buf.ends_with(b"data\r\n\r\n")
+        })
+        .expect("reading");
+        let sres = s(&res);
+        let pos = sres.find("GMT\r\n\r\n").expect("find GMT");
+        let body = &sres[pos + "GMT\r\n\r\n".len()..];
+        assert_eq!(
+            body,
+            "5\r\nhello\r\n0\r\nchunky-trailer: header data\r\n\r\n"
+        );
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    http1::Builder::new()
+        .permissive_trailers(true)
+        .serve_connection(
+            TokioIo::new(socket),
+            service_fn(|_| async move {
+                let mut trailers = HeaderMap::new();
+                trailers.insert("chunky-trailer", "header data".parse().unwrap());
+                let body = StreamBody::new(futures_util::stream::iter([
+                    Ok::<_, hyper::Error>(hyper::body::Frame::data(Bytes::from("hello"))),
+                    Ok(hyper::body::Frame::trailers(trailers)),
+                ]));
+                // No `Trailer` header declaring the field either.
+                Ok::<_, hyper::Error>(Response::new(BoxBody::new(body)))
+            }),
+        )
+        .await
+        .unwrap();
+    client.join().unwrap();
+}
+
+#[tokio::test]
+async fn http1_non_ascii_request_target_is_percent_encoded() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let client = thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"GET /caf\xc3\xa9?q=\xc3\xbc HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let res = read_until(&mut tcp, |buf| buf.ends_with(b"%BC")).expect("reading");
+        let sres = s(&res);
+        assert!(sres.starts_with("HTTP/1.1 200 OK\r\n"), "{sres}");
+        assert!(sres.ends_with("\r\n\r\n/caf%C3%A9?q=%C3%BC"), "{sres}");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    http1::Builder::new()
+        .serve_connection(
+            TokioIo::new(socket),
+            service_fn(|req: Request<IncomingBody>| async move {
+                let target = req.uri().path_and_query().unwrap().as_str().to_owned();
+                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(target))))
+            }),
+        )
+        .await
+        .unwrap();
+    client.join().unwrap();
+}
+
+#[tokio::test]
+async fn http1_headers_relayed_in_original_order_and_case() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let client = thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        // Repeated names interleaved with others, in mixed case.
+        tcp.write_all(b"GET / HTTP/1.1\r\nX-One: 1\r\nx-two: a\r\nX-One: 2\r\nX-Two: b\r\n\r\n")
+            .unwrap();
+        let res = read_until(&mut tcp, |buf| buf.ends_with(b"\r\n\r\n")).expect("reading");
+        let expected = "HTTP/1.1 200 OK\r\nX-One: 1\r\nx-two: a\r\nX-One: 2\r\nX-Two: b\r\n";
+        assert_eq!(&s(&res)[..expected.len()], expected);
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    http1::Builder::new()
+        .preserve_header_case(true)
+        .serve_connection(
+            TokioIo::new(socket),
+            service_fn(|req: Request<IncomingBody>| async move {
+                // Echo the request headers back with their recorded case + order.
+                let mut res = Response::new(Empty::<Bytes>::new());
+                *res.headers_mut() = req.headers().clone();
+                res.extensions_mut().insert(
+                    req.extensions()
+                        .get::<hyper::ext::HeaderCaseMap>()
+                        .unwrap()
+                        .clone(),
+                );
+                res.extensions_mut().insert(
+                    req.extensions()
+                        .get::<hyper::ext::OriginalHeaderOrder>()
+                        .unwrap()
+                        .clone(),
+                );
+                Ok::<_, hyper::Error>(res)
+            }),
+        )
+        .await
+        .unwrap();
+    client.join().unwrap();
+}
+
 #[test]
 fn header_name_too_long() {
     let server = serve();

@@ -74,7 +74,6 @@ pub(crate) struct ParseContext<'a> {
     h1_parser_config: ParserConfig,
     h1_max_headers: Option<usize>,
     preserve_header_case: bool,
-    #[cfg(feature = "ffi")]
     preserve_header_order: bool,
     h09_responses: bool,
     #[cfg(feature = "client")]
