@@ -161,8 +161,9 @@ impl Encoder {
     }
 
     /// Encodes the chunked-body trailer section. Only fields listed in the
-    /// response's `Trailer` header are written, unless `permissive` is set, in
-    /// which case every valid trailer field is written as given.
+    /// message's `Trailer` header are written, unless `permissive` is set, in
+    /// which case every valid trailer field is written as given (whether or not
+    /// a `Trailer` header declared it).
     pub(crate) fn encode_trailers<B>(
         &self,
         trailers: HeaderMap,
@@ -174,9 +175,13 @@ impl Encoder {
             Kind::Chunked(allowed_trailer_fields)
                 if permissive || allowed_trailer_fields.is_some() =>
             {
-                let allowed_set: Option<HashSet<&HeaderName>> = allowed_trailer_fields
-                    .as_ref()
-                    .map(|fields| fields.iter().collect());
+                let allowed_set: Option<HashSet<&HeaderName>> = if permissive {
+                    None
+                } else {
+                    allowed_trailer_fields
+                        .as_ref()
+                        .map(|fields| fields.iter().collect())
+                };
 
                 let mut cur_name = None;
                 let mut allowed_trailers = HeaderMap::new();

@@ -1529,6 +1529,43 @@ async fn http1_informational_responses_are_relayed() {
 }
 
 #[tokio::test]
+async fn http1_informational_responses_skip_http10_and_100_continue() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let client = thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        // An HTTP/1.0 client must not receive any 1xx; the 100 is the
+        // connection's own business on either version.
+        tcp.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        let res = read_until(&mut tcp, |buf| buf.ends_with(b"ok")).expect("reading");
+        let sres = s(&res);
+        assert!(sres.starts_with("HTTP/1.0 200 OK\r\n"), "{sres}");
+        assert!(!sres.contains("103"), "{sres}");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    http1::Builder::new()
+        .informational_responses(true)
+        .serve_connection(
+            TokioIo::new(socket),
+            service_fn(|req: Request<IncomingBody>| async move {
+                let sender = req
+                    .extensions()
+                    .get::<hyper::ext::InformationalSender>()
+                    .expect("InformationalSender extension");
+                for status in [StatusCode::CONTINUE, StatusCode::EARLY_HINTS] {
+                    let interim = Response::builder().status(status).body(()).unwrap();
+                    sender.send(interim).expect("send interim");
+                }
+                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("ok"))))
+            }),
+        )
+        .await
+        .unwrap();
+    client.join().unwrap();
+}
+
+#[tokio::test]
 async fn http1_permissive_trailers_without_te_or_trailer_header() {
     let (listener, addr) = setup_tcp_listener();
 
@@ -1563,6 +1600,50 @@ async fn http1_permissive_trailers_without_te_or_trailer_header() {
                 ]));
                 // No `Trailer` header declaring the field either.
                 Ok::<_, hyper::Error>(Response::new(BoxBody::new(body)))
+            }),
+        )
+        .await
+        .unwrap();
+    client.join().unwrap();
+}
+
+#[tokio::test]
+async fn http1_permissive_trailers_ignore_trailer_header_allow_list() {
+    let (listener, addr) = setup_tcp_listener();
+
+    let client = thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"GET / HTTP/1.1\r\nTE: trailers\r\n\r\n")
+            .unwrap();
+        let res = read_until(&mut tcp, |buf| buf.ends_with(b"tail\r\n\r\n")).expect("reading");
+        let sres = s(&res);
+        let pos = sres.find("GMT\r\n\r\n").expect("find GMT");
+        let body = &sres[pos + "GMT\r\n\r\n".len()..];
+        assert_eq!(
+            body,
+            "5\r\nhello\r\n0\r\nchunky-trailer: header data\r\nx-extra: tail\r\n\r\n"
+        );
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    http1::Builder::new()
+        .permissive_trailers(true)
+        .serve_connection(
+            TokioIo::new(socket),
+            service_fn(|_| async move {
+                let mut trailers = HeaderMap::new();
+                trailers.insert("chunky-trailer", "header data".parse().unwrap());
+                trailers.insert("x-extra", "tail".parse().unwrap());
+                let body = StreamBody::new(futures_util::stream::iter([
+                    Ok::<_, hyper::Error>(hyper::body::Frame::data(Bytes::from("hello"))),
+                    Ok(hyper::body::Frame::trailers(trailers)),
+                ]));
+                // `Trailer` declares only one of the two fields; both are written.
+                let res = Response::builder()
+                    .header("trailer", "chunky-trailer")
+                    .body(BoxBody::new(body))
+                    .unwrap();
+                Ok::<_, hyper::Error>(res)
             }),
         )
         .await

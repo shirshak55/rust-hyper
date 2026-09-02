@@ -82,7 +82,10 @@ where
                 // If they tell us otherwise, we'll downgrade in `read_head`.
                 version: Version::HTTP_11,
                 allow_trailer_fields: false,
-                permissive_trailers: false,
+                // A client writes request trailers as the body gave them; only a
+                // server gates them (on `TE: trailers` / the `Trailer` header)
+                // unless made permissive.
+                permissive_trailers: !T::is_server(),
             },
             _marker: PhantomData,
         }
@@ -602,11 +605,17 @@ where
 
     /// Writes an interim (1xx) response head ahead of the final head. Dropped
     /// when the connection can't write a head right now (a head is already in
-    /// progress, or the write buffer is backed up).
+    /// progress, or the write buffer is backed up), when the client speaks
+    /// HTTP/1.0 (RFC 9110 §15.2: no 1xx to a 1.0 client), or for `100 Continue`
+    /// (the connection writes its own on `Expect: 100-continue`).
     #[cfg(feature = "server")]
     pub(crate) fn write_informational(&mut self, head: MessageHead<http::StatusCode>) {
         if !self.can_write_head() {
             debug!("dropping informational response: cannot write a head now");
+            return;
+        }
+        if self.state.version == Version::HTTP_10 || head.subject == http::StatusCode::CONTINUE {
+            debug!("dropping informational response {} for HTTP/1.0 client or 100 Continue", head.subject);
             return;
         }
         let buf = self.io.headers_buf();
