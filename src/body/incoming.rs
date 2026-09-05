@@ -388,29 +388,12 @@ impl Sender {
             .map_err(|_| crate::Error::new_closed())
     }
 
-    /// Send trailers on trailers channel.
-    #[allow(unused)]
-    #[allow(clippy::unused_async_trait_impl)]
-    pub(crate) async fn send_trailers(&mut self, trailers: HeaderMap) -> crate::Result<()> {
-        let tx = match self.trailers_tx.take() {
-            Some(tx) => tx,
-            None => return Err(crate::Error::new_closed()),
-        };
-        tx.send(trailers).map_err(|_| crate::Error::new_closed())
-    }
-
     /// Try to send data on this channel.
     ///
     /// # Errors
     ///
     /// Returns `Err(Bytes)` if the channel could not (currently) accept
     /// another `Bytes`.
-    ///
-    /// # Note
-    ///
-    /// This is mostly useful for when trying to send from some other thread
-    /// that doesn't have an async context. If in an async context, prefer
-    /// `send_data()` instead.
     #[cfg(feature = "http1")]
     pub(crate) fn try_send_data(&mut self, chunk: Bytes) -> Result<(), Bytes> {
         self.data_tx

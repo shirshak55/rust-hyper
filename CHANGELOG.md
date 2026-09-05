@@ -1,3 +1,8 @@
+### 2026-09-05 — Simplification/removal: incoming HTTP/1 body sender
+- Removed unused private async `Sender::send_trailers`, its lint allowances, and stale guidance recommending test-only `send_data`; active trailer delivery and errors are unchanged.
+- Validation: macOS/Linux nightly full release builds and 28 existing body/trailer tests each; macOS HTTP/1 client/server checks, rustfmt, and six matching before/after real TCP cases including malformed-trailer negative controls.
+- Remaining: the same 58 pre-existing strict Clippy errors and client-only unused import warning; Windows and live external services were not validated. Next pass: choose a different subsystem.
+
 ### 2026-09-05 — Simplification/removal: HTTP/2 BDP duration conversion
 - Removed the private `seconds` conversion helper and three restatement comments; use `Duration::as_secs_f64()` while retaining RTT averaging and flow-control policy.
 - Validation: macOS/Linux nightly release builds, seven HTTP/2 keep-alive integration tests per platform, and HTTP/2 client/server feature checks; macOS rustfmt and isolated before/after comparison of 56 durations plus 33 BDP steps, with a truncation negative control.
