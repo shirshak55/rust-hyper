@@ -11,12 +11,12 @@ use http::{
 
 #[cfg(feature = "http1")]
 pub(super) fn connection_keep_alive(value: &HeaderValue) -> bool {
-    connection_has(value, "keep-alive")
+    header_value_has_token(value, "keep-alive")
 }
 
 #[cfg(feature = "http1")]
 pub(super) fn connection_close(value: &HeaderValue) -> bool {
-    connection_has(value, "close")
+    header_value_has_token(value, "close")
 }
 
 // Returns true if any `Connection` header field carries a `close` token.
@@ -31,7 +31,7 @@ pub(super) fn connection_any_close(headers: &http::HeaderMap) -> bool {
 }
 
 #[cfg(feature = "http1")]
-fn connection_has(value: &HeaderValue, needle: &str) -> bool {
+fn header_value_has_token(value: &HeaderValue, needle: &str) -> bool {
     if let Ok(s) = value.to_str() {
         for val in s.split(',') {
             if val.trim().eq_ignore_ascii_case(needle) {
@@ -44,22 +44,10 @@ fn connection_has(value: &HeaderValue, needle: &str) -> bool {
 
 #[cfg(feature = "http1")]
 pub(super) fn te_is_trailers(headers: &http::HeaderMap) -> bool {
-    header_value_list_has(headers.get_all(http::header::TE).into_iter(), "trailers")
-}
-
-#[cfg(feature = "http1")]
-fn header_value_list_has(values: http::header::ValueIter<'_, HeaderValue>, needle: &str) -> bool {
-    for value in values {
-        if let Ok(line) = value.to_str() {
-            for token in line.split(',') {
-                if token.trim().eq_ignore_ascii_case(needle) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
+    headers
+        .get_all(http::header::TE)
+        .iter()
+        .any(|value| header_value_has_token(value, "trailers"))
 }
 
 #[cfg(all(feature = "http1", feature = "server"))]

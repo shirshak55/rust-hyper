@@ -1,3 +1,9 @@
+### 2026-09-04 — Refactor pass: HTTP/1 header token matching
+
+- Share the Connection and TE comma-token predicate so case, whitespace, and invalid-value policy cannot diverge; preserve all header iteration and behavior.
+- Validation: nightly release builds on macOS/Linux; 13 before/after release-library TCP scenarios covering trailers, reuse, mixed case, repeated TE lines, invalid bytes, and negative controls. macOS: 115 library tests passed (6 already ignored), 8 targeted server tests passed, rustfmt and HTTP/1 client/server feature checks completed. Linux: 11 targeted header/server tests passed.
+- Remaining: strict nightly Clippy reports 58 errors in untouched files; client-only check warns about the existing HashMap import in src/proto/h1/role.rs. Windows was not validated. Next pass: bug hunt in a different subsystem.
+
 ### v1.11.1 (2026-08-27)
 
 
