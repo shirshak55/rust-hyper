@@ -1,3 +1,8 @@
+### 2026-09-05 — Simplification/removal: HTTP/2 BDP duration conversion
+- Removed the private `seconds` conversion helper and three restatement comments; use `Duration::as_secs_f64()` while retaining RTT averaging and flow-control policy.
+- Validation: macOS/Linux nightly release builds, seven HTTP/2 keep-alive integration tests per platform, and HTTP/2 client/server feature checks; macOS rustfmt and isolated before/after comparison of 56 durations plus 33 BDP steps, with a truncation negative control.
+- Remaining: strict macOS Clippy reports 58 pre-existing errors outside this area; Windows and live adaptive-window traffic were not validated. Next pass: choose a different subsystem.
+
 ### 2026-09-04 — Refactor pass: HTTP/1 header token matching
 
 - Share the Connection and TE comma-token predicate so case, whitespace, and invalid-value policy cannot diverge; preserve all header iteration and behavior.

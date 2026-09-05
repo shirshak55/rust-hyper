@@ -371,17 +371,14 @@ impl Bdp {
             return None;
         }
 
-        // average the rtt
-        let rtt = seconds(rtt);
+        let rtt = rtt.as_secs_f64();
         if self.rtt == 0.0 {
-            // First sample means rtt is first rtt.
             self.rtt = rtt;
         } else {
             // Weigh this rtt as 1/8 for a moving average.
             self.rtt += (rtt - self.rtt) * 0.125;
         }
 
-        // calculate the current bandwidth
         let bw = (bytes as f64) / (self.rtt * 1.5);
         trace!("current bandwidth = {:.1}B/s", bw);
 
@@ -418,12 +415,6 @@ impl Bdp {
             }
         }
     }
-}
-
-fn seconds(dur: Duration) -> f64 {
-    const NANOS_PER_SEC: f64 = 1_000_000_000.0;
-    let secs = dur.as_secs() as f64;
-    secs + (f64::from(dur.subsec_nanos())) / NANOS_PER_SEC
 }
 
 // ===== impl KeepAlive =====
