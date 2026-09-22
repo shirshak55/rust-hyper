@@ -615,7 +615,10 @@ where
             return;
         }
         if self.state.version == Version::HTTP_10 || head.subject == http::StatusCode::CONTINUE {
-            debug!("dropping informational response {} for HTTP/1.0 client or 100 Continue", head.subject);
+            debug!(
+                "dropping informational response {} for HTTP/1.0 client or 100 Continue",
+                head.subject
+            );
             return;
         }
         let buf = self.io.headers_buf();
@@ -766,8 +769,7 @@ where
     }
 
     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) {
-        if T::is_server() && !self.state.allow_trailer_fields && !self.state.permissive_trailers
-        {
+        if T::is_server() && !self.state.allow_trailer_fields && !self.state.permissive_trailers {
             debug!("trailers not allowed to be sent");
             return;
         }
@@ -775,13 +777,11 @@ where
 
         match &mut self.state.writing {
             Writing::Body(encoder) => {
-                if let Some(enc_buf) =
-                    encoder.encode_trailers(
-                        trailers,
-                        self.state.title_case_headers,
-                        self.state.permissive_trailers,
-                    )
-                {
+                if let Some(enc_buf) = encoder.encode_trailers(
+                    trailers,
+                    self.state.title_case_headers,
+                    self.state.permissive_trailers,
+                ) {
                     self.io.buffer(enc_buf);
 
                     self.state.writing = if encoder.is_last() || encoder.is_close_delimited() {

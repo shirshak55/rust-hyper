@@ -236,14 +236,10 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
 
       - name: Install cbindgen
-        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7
-        with:
-          tool: cbindgen
+        run: cargo install cbindgen --locked
 
       - name: Install cargo-expand
-        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7
-        with:
-          tool: cargo-expand
+        run: cargo install cargo-expand --locked
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
@@ -310,9 +306,7 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-check-external-types
-        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7
-        with:
-          tool: cargo-check-external-types@0.5.0
+        run: cargo install cargo-check-external-types --version 0.5.0 --locked
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 

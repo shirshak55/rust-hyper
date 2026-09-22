@@ -543,7 +543,9 @@ mod tests {
             ),
         ]);
 
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
+        let buf1 = encoder
+            .encode_trailers::<&[u8]>(headers, false, false)
+            .unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -570,7 +572,9 @@ mod tests {
             ),
         ]);
 
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
+        let buf1 = encoder
+            .encode_trailers::<&[u8]>(headers, false, false)
+            .unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -596,7 +600,9 @@ mod tests {
             HeaderValue::from_static("second"),
         );
 
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
+        let buf1 = encoder
+            .encode_trailers::<&[u8]>(headers, false, false)
+            .unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -622,7 +628,9 @@ mod tests {
         let trailers = vec![];
         let encoder = encoder.into_chunked_with_trailing_fields(trailers);
 
-        assert!(encoder.encode_trailers::<&[u8]>(headers, false, false).is_none());
+        assert!(encoder
+            .encode_trailers::<&[u8]>(headers, false, false)
+            .is_none());
     }
 
     #[test]
@@ -659,7 +667,9 @@ mod tests {
         headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("header data"));
         headers.insert(TE, HeaderValue::from_static("header data"));
 
-        assert!(encoder.encode_trailers::<&[u8]>(headers, true, false).is_none());
+        assert!(encoder
+            .encode_trailers::<&[u8]>(headers, true, false)
+            .is_none());
     }
 
     #[test]
@@ -672,7 +682,9 @@ mod tests {
             HeaderName::from_static("chunky-trailer"),
             HeaderValue::from_static("header data"),
         )]);
-        let buf1 = encoder.encode_trailers::<&[u8]>(headers, true, false).unwrap();
+        let buf1 = encoder
+            .encode_trailers::<&[u8]>(headers, true, false)
+            .unwrap();
 
         let mut dst = Vec::new();
         dst.put(buf1);
@@ -703,7 +715,9 @@ mod tests {
             HeaderValue::from_static("trailer value"),
         )]);
 
-        let buf = encoder.encode_trailers::<&[u8]>(headers, false, false).unwrap();
+        let buf = encoder
+            .encode_trailers::<&[u8]>(headers, false, false)
+            .unwrap();
         let mut dst = Vec::new();
         dst.put(buf);
         assert_eq!(dst, b"0\r\nchunky-trailer: trailer value\r\n\r\n");

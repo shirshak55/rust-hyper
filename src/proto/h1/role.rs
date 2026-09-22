@@ -577,7 +577,15 @@ impl Server {
             }
         }
 
-        Self::encode_headers(msg, dst, is_last, orig_len, wrote_len, LowercaseWriter, order)
+        Self::encode_headers(
+            msg,
+            dst,
+            is_last,
+            orig_len,
+            wrote_len,
+            LowercaseWriter,
+            order,
+        )
     }
 
     #[cold]
@@ -651,7 +659,15 @@ impl Server {
             title_case_headers: msg.title_case_headers,
         };
 
-        Self::encode_headers(msg, dst, is_last, orig_len, wrote_len, header_name_writer, order)
+        Self::encode_headers(
+            msg,
+            dst,
+            is_last,
+            orig_len,
+            wrote_len,
+            header_name_writer,
+            order,
+        )
     }
 
     #[inline]
@@ -708,7 +724,8 @@ impl Server {
         let entries: Vec<(Option<HeaderName>, HeaderValue)> = match order {
             Some(order) => {
                 let mut prev: Option<HeaderName> = None;
-                let entries = order.entries(&msg.head.headers)
+                let entries = order
+                    .entries(&msg.head.headers)
                     .into_iter()
                     .map(|(name, _, value)| {
                         let changed = prev.as_ref() != Some(&name);
@@ -1656,7 +1673,10 @@ pub(crate) fn encode_informational(
         Some(reason) => extend(dst, reason.as_bytes()),
         None => extend(
             dst,
-            head.subject.canonical_reason().unwrap_or("<none>").as_bytes(),
+            head.subject
+                .canonical_reason()
+                .unwrap_or("<none>")
+                .as_bytes(),
         ),
     }
     extend(dst, b"\r\n");
