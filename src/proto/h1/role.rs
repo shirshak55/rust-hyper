@@ -349,7 +349,7 @@ impl Http1Transaction for Server {
             return Err(Parse::transfer_encoding_invalid());
         }
 
-        if is_te && is_cl {
+        if (is_te && is_cl) || headers::connection_any_close(&headers) {
             keep_alive = false;
         }
 
@@ -681,6 +681,8 @@ impl Server {
         let mut is_name_written = false;
         let mut must_write_chunked = false;
         let mut prev_con_len = None;
+        let mut wrote_content_length = false;
+        let mut wrote_transfer_encoding = false;
 
         macro_rules! handle_is_name_written {
             () => {{
@@ -719,16 +721,24 @@ impl Server {
             }
             None => msg.head.headers.drain().collect(),
         };
+        let mut remaining_te_groups = entries
+            .iter()
+            .filter(|(name, _)| name.as_ref() == Some(&header::TRANSFER_ENCODING))
+            .count();
         'headers: for (opt_name, value) in entries {
             if let Some(n) = opt_name {
+                if n == header::TRANSFER_ENCODING {
+                    remaining_te_groups -= 1;
+                }
                 cur_name = Some(n);
                 handle_is_name_written!();
+                must_write_chunked = false;
                 is_name_written = false;
             }
             let name = cur_name.as_ref().expect("current header name");
             match *name {
                 header::CONTENT_LENGTH => {
-                    if wrote_len && !is_name_written {
+                    if wrote_len && !wrote_content_length {
                         warn!("unexpected content-length found, canceling");
                         rewind(dst);
                         return Err(crate::Error::new_user_header());
@@ -754,7 +764,7 @@ impl Server {
                                 }
                             }
 
-                            if !is_name_written {
+                            if !wrote_content_length {
                                 encoder = Encoder::length(known_len);
                                 header_name_writer.write_header_name_with_colon(
                                     dst,
@@ -763,6 +773,7 @@ impl Server {
                                 );
                                 extend(dst, value.as_bytes());
                                 wrote_len = true;
+                                wrote_content_length = true;
                                 is_name_written = true;
                             }
                             continue 'headers;
@@ -783,7 +794,6 @@ impl Server {
                                         rewind(dst);
                                         return Err(crate::Error::new_user_header());
                                     }
-                                    debug_assert!(is_name_written);
                                     continue 'headers;
                                 } else {
                                     // we haven't written content-length yet!
@@ -797,6 +807,7 @@ impl Server {
                                     wrote_len = true;
                                     is_name_written = true;
                                     prev_con_len = Some(len);
+                                    wrote_content_length = true;
                                     continue 'headers;
                                 }
                             } else {
@@ -826,9 +837,10 @@ impl Server {
                         }
                     }
                     wrote_len = true;
+                    wrote_content_length = true;
                 }
                 header::TRANSFER_ENCODING => {
-                    if wrote_len && !is_name_written {
+                    if wrote_len && !wrote_transfer_encoding {
                         warn!("unexpected transfer-encoding found, canceling");
                         rewind(dst);
                         return Err(crate::Error::new_user_header());
@@ -842,7 +854,8 @@ impl Server {
                     wrote_len = true;
                     // Must check each value, because `chunked` needs to be the
                     // last encoding, or else we add it.
-                    must_write_chunked = !headers::is_chunked_(&value);
+                    must_write_chunked = remaining_te_groups == 0 && !headers::is_chunked_(&value);
+                    wrote_transfer_encoding = true;
 
                     if !is_name_written {
                         encoder = Encoder::chunked();
@@ -1165,6 +1178,8 @@ impl Http1Transaction for Client {
                 headers.append(name, value);
             }
 
+            keep_alive &= !headers::connection_any_close(&headers);
+
             let mut extensions = http::Extensions::default();
 
             if let Some(header_case_map) = header_case_map {
@@ -1449,7 +1464,7 @@ impl Client {
         // This is because we need a second mutable borrow to remove
         // content-length header.
         if let Some(encoder) = encoder {
-            if should_remove_con_len && existing_con_len.is_some() {
+            if should_remove_con_len {
                 headers.remove(header::CONTENT_LENGTH);
             }
             return encoder;

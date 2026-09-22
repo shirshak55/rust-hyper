@@ -870,7 +870,11 @@ where
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        if self.state.is_read_closed() || !matches!(self.state.writing, Writing::KeepAlive) {
+            ready!(self.io.poll_flush_force(cx))?;
+        } else {
+            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        }
         self.try_keep_alive(cx);
         trace!("flushed({}): {:?}", T::LOG, self.state);
         Poll::Ready(Ok(()))

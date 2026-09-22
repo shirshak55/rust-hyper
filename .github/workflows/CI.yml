@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - wiremason
 
 env:
   RUST_BACKTRACE: 1
@@ -43,6 +44,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
+          toolchain: nightly
           components: rustfmt
 
       - name: cargo fmt --check
@@ -52,9 +54,14 @@ jobs:
             exit 1
           fi
 
+      - name: Check unused dependencies
+        run: |
+          cargo install cargo-machete --locked
+          cargo machete
+
   lint:
     name: Linter
-    #needs: [style]
+    needs: [style]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -62,6 +69,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: nightly
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
@@ -298,12 +307,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
-          toolchain: nightly-2025-10-18 # Compatible version for cargo-check-external-types
+          toolchain: nightly
 
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7
         with:
-          tool: cargo-check-external-types@0.4.0
+          tool: cargo-check-external-types@0.5.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 

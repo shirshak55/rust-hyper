@@ -54,22 +54,32 @@ fn strip_connection_headers(headers: &mut HeaderMap, kind: MessageKind) {
         }
     }
 
-    #[cfg(not(feature = "client"))]
-    let _ = kind;
-    #[cfg(feature = "client")]
-    if matches!(kind, MessageKind::Request) {
-        if headers
-            .get(http::header::TE)
-            .map_or(false, |te_header| te_header != "trailers")
-        {
-            warn!("TE headers not set to \"trailers\" are illegal in HTTP/2 requests");
-            headers.remove(http::header::TE);
+    match kind {
+        #[cfg(feature = "client")]
+        MessageKind::Request => {
+            if headers
+                .get_all(http::header::TE)
+                .iter()
+                .any(|te_header| te_header != "trailers")
+            {
+                warn!("TE headers not set to \"trailers\" are illegal in HTTP/2 requests");
+                headers.remove(http::header::TE);
+            }
         }
-    } else if headers.remove(http::header::TE).is_some() {
-        warn!("TE headers illegal in HTTP/2 responses");
+        #[cfg(feature = "server")]
+        MessageKind::Response => {
+            if headers.remove(http::header::TE).is_some() {
+                warn!("TE headers illegal in HTTP/2 responses");
+            }
+        }
     }
 
-    if let Some(header) = headers.remove(CONNECTION) {
+    let connection_headers = headers
+        .get_all(CONNECTION)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if headers.remove(CONNECTION).is_some() {
         warn!(
             "Connection header illegal in HTTP/2: {}",
             CONNECTION.as_str()
@@ -80,10 +90,12 @@ fn strip_connection_headers(headers: &mut HeaderMap, kind: MessageKind) {
         // Iterate these names and remove them as headers. Connection-specific headers are
         // forbidden in HTTP2, as that information has been moved into frame types of the h2
         // protocol.
-        if let Ok(header_contents) = header.to_str() {
-            for name in header_contents.split(',') {
-                let name = name.trim();
-                headers.remove(name);
+        for header in connection_headers {
+            if let Ok(header_contents) = header.to_str() {
+                for name in header_contents.split(',') {
+                    let name = name.trim();
+                    headers.remove(name);
+                }
             }
         }
     }

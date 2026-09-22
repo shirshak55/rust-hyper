@@ -155,7 +155,7 @@ where
     }
 
     pub(crate) fn can_buffer(&self) -> bool {
-        self.flush_pipeline || self.write_buf.can_buffer()
+        self.write_buf.can_buffer()
     }
 
     pub(crate) fn consume_leading_lines(&mut self) {
@@ -268,9 +268,19 @@ where
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.flush_pipeline && !self.read_buf.is_empty() {
+        if self.flush_pipeline
+            && !self.read_buf.is_empty()
+            && !self.read_blocked
+            && self.write_buf.can_buffer()
+        {
             Poll::Ready(Ok(()))
-        } else if self.write_buf.remaining() == 0 {
+        } else {
+            self.poll_flush_force(cx)
+        }
+    }
+
+    pub(crate) fn poll_flush_force(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_buf.remaining() == 0 {
             Pin::new(&mut self.io).poll_flush(cx)
         } else {
             if let WriteStrategy::Flatten = self.write_buf.strategy {
@@ -327,7 +337,7 @@ where
     }
 
     pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_flush(cx))?;
+        ready!(self.poll_flush_force(cx))?;
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
 

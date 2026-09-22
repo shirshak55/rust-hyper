@@ -117,16 +117,15 @@ where
 {
     fn tick(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), crate::Error>> {
         let mut me = self.project();
+        me.close_notify.task.register(cx.waker());
 
         // this is a manual `select()` over 3 "futures", so we always need
         // to be sure they are ready and/or we are waiting notification of
         // one of the sides hanging up, so the task doesn't live around
         // longer than it's meant to.
         loop {
-            // we don't have the next chunk of data yet, so just reserve 1 byte to make
-            // sure there's some capacity available. h2 will handle the capacity management
-            // for the actual body chunk.
-            me.h2_tx.reserve_capacity(1);
+            me.h2_tx
+                .reserve_capacity(usize::from(me.rx.size_hint().0 != 0));
 
             let h2_has_capacity = if me.h2_tx.capacity() == 0 {
                 // poll_capacity oddly needs a loop
@@ -289,7 +288,10 @@ impl Write for H2Upgraded {
 
         let n = buf.len();
         match self.send_stream.tx.start_send(Cursor::new(buf.into())) {
-            Ok(()) => Poll::Ready(Ok(n)),
+            Ok(()) => {
+                self.send_stream.close_notify.task.wake();
+                Poll::Ready(Ok(n))
+            }
             Err(_task_dropped) => {
                 // if the task dropped, check if there was an error
                 // otherwise i guess its a broken pipe
