@@ -48,6 +48,8 @@ use http::header::{HeaderMap, HeaderValue, IntoHeaderName, ValueIter};
 use std::collections::HashMap;
 #[cfg(feature = "http2")]
 use std::fmt;
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+use std::sync::{Arc, OnceLock};
 
 #[cfg(any(feature = "http1", feature = "ffi"))]
 mod h1_reason_phrase;
@@ -343,6 +345,18 @@ impl Default for OriginalHeaderOrder {
         Self::new()
     }
 }
+
+/// An HTTP/1 chunked message's trailer fields in the order received, each name spelled
+/// as sent, which the trailers `HeaderMap` its body yields lowercases and groups.
+///
+/// With `preserve_header_case`, hyper inserts one into each chunked message it reads and
+/// fills it as it reads the trailers, before the body yields them. A message hyper writes
+/// carrying a filled one sends its trailers in that spelling and order. Clones share the
+/// fields, so a proxy can hand a received message's record (or its cell, to another HTTP
+/// library) to the message it relays before the trailers arrive.
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, HeaderValue)>>>);
 
 /// Sends interim (1xx) response heads to the client ahead of the service's final
 /// response, on an HTTP/1 or HTTP/2 connection built with `informational_responses`

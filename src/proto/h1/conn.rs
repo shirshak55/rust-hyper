@@ -245,7 +245,7 @@ where
             }
         }
 
-        let msg = match self.io.parse::<T>(
+        let mut msg = match self.io.parse::<T>(
             cx,
             ParseContext {
                 cached_headers: &mut self.state.cached_headers,
@@ -310,6 +310,15 @@ where
             Wants::EMPTY
         };
 
+        let raw_trailers =
+            if self.state.preserve_header_case && msg.decode == DecodedLength::CHUNKED {
+                let raw = crate::ext::RawTrailers::default();
+                msg.head.extensions.insert(raw.clone());
+                Some(raw)
+            } else {
+                None
+            };
+
         if msg.decode == DecodedLength::ZERO {
             if msg.expect_continue {
                 debug!("ignoring expect-continue since body is empty");
@@ -320,19 +329,17 @@ where
             }
         } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
-            self.state.reading = Reading::Continue(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Continue(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    .with_raw_trailers(raw_trailers),
+            );
             wants = wants.add(Wants::EXPECT);
         } else {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
-            self.state.reading = Reading::Body(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Body(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    .with_raw_trailers(raw_trailers),
+            );
         }
 
         self.state.allow_trailer_fields = headers::te_is_trailers(&msg.head.headers);
@@ -659,6 +666,7 @@ where
 
         self.enforce_version(&mut head);
 
+        let raw_trailers = head.extensions.get::<crate::ext::RawTrailers>().cloned();
         let buf = self.io.headers_buf();
         match super::role::encode_headers::<T>(
             Encode {
@@ -684,7 +692,7 @@ where
                         head.extensions.remove::<crate::ext::OnInformational>();
                 }
 
-                Some(encoder)
+                Some(encoder.with_raw_trailers(raw_trailers))
             }
             Err(err) => {
                 self.state.error = Some(err);

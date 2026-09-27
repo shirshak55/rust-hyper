@@ -13,7 +13,8 @@ use http::{
 };
 
 use super::io::WriteBuf;
-use super::role::{write_headers, write_headers_title_case};
+use super::role::write_message_headers;
+use crate::ext::{HeaderCaseMap, OriginalHeaderOrder, RawTrailers};
 
 type StaticBuf = &'static [u8];
 
@@ -22,6 +23,7 @@ type StaticBuf = &'static [u8];
 pub(crate) struct Encoder {
     kind: Kind,
     is_last: bool,
+    raw_trailers: Option<RawTrailers>,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,7 @@ impl Encoder {
         Encoder {
             kind,
             is_last: false,
+            raw_trailers: None,
         }
     }
     pub(crate) fn chunked() -> Encoder {
@@ -82,9 +85,16 @@ impl Encoder {
             Kind::Chunked(_) => Encoder {
                 kind: Kind::Chunked(Some(trailers)),
                 is_last: self.is_last,
+                raw_trailers: self.raw_trailers,
             },
             _ => self,
         }
+    }
+
+    /// Writes the trailers with the spelling and order `raw` records, once it does.
+    pub(crate) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
+        self.raw_trailers = raw;
+        self
     }
 
     pub(crate) fn is_eof(&self) -> bool {
@@ -204,11 +214,12 @@ impl Encoder {
                 }
 
                 let mut buf = Vec::new();
-                if title_case_headers {
-                    write_headers_title_case(&allowed_trailers, &mut buf);
-                } else {
-                    write_headers(&allowed_trailers, &mut buf);
-                }
+                write_message_headers(
+                    &allowed_trailers,
+                    &trailer_extensions(self.raw_trailers.as_ref()),
+                    &mut buf,
+                    title_case_headers,
+                );
 
                 if buf.is_empty() {
                     return None;
@@ -272,6 +283,24 @@ impl Encoder {
             }
         }
     }
+}
+
+/// The case and order extensions that write trailers as `raw` recorded them, once it has.
+fn trailer_extensions(raw: Option<&RawTrailers>) -> http::Extensions {
+    let mut extensions = http::Extensions::new();
+    if let Some(fields) = raw.and_then(|raw| raw.0.get()) {
+        let mut case = HeaderCaseMap::default();
+        let mut order = OriginalHeaderOrder::default();
+        for (spelling, _) in fields {
+            if let Ok(name) = HeaderName::from_bytes(spelling) {
+                case.append(&name, spelling.clone());
+                order.append(name);
+            }
+        }
+        extensions.insert(case);
+        extensions.insert(order);
+    }
+    extensions
 }
 
 fn is_valid_trailer_field(name: &HeaderName) -> bool {

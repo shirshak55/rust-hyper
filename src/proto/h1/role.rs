@@ -1706,7 +1706,7 @@ fn percent_encode_non_ascii(raw: &[u8]) -> Bytes {
 
 /// Writes `Name: value` lines honoring the recorded original order and spelling
 /// when the message carries them, else title-case or lowercase.
-fn write_message_headers(
+pub(super) fn write_message_headers(
     headers: &HeaderMap,
     extensions: &http::Extensions,
     dst: &mut Vec<u8>,
