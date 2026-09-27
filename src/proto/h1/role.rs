@@ -836,11 +836,15 @@ impl Server {
                         None => {
                             // We have no body to actually send,
                             // but the headers claim a content-length.
-                            // There's only 2 ways this makes sense:
+                            // There's only 3 ways this makes sense:
                             //
                             // - The header says the length is `0`.
                             // - This is a response to a `HEAD` request.
-                            if msg.req_method == &Some(Method::HEAD) {
+                            // - This is a `304 Not Modified`, where it is the
+                            //   length a `200` would carry (RFC 9110 §8.6).
+                            if msg.req_method == &Some(Method::HEAD)
+                                || msg.head.subject == StatusCode::NOT_MODIFIED
+                            {
                                 debug_assert_eq!(encoder, Encoder::length(0));
                             } else {
                                 if value.as_bytes() != b"0" {
