@@ -345,20 +345,21 @@ impl Default for OriginalHeaderOrder {
 }
 
 /// Sends interim (1xx) response heads to the client ahead of the service's final
-/// response, on an HTTP/1 connection built with
-/// [`informational_responses`](crate::server::conn::http1::Builder::informational_responses).
+/// response, on an HTTP/1 or HTTP/2 connection built with `informational_responses`
+/// ([HTTP/1](crate::server::conn::http1::Builder::informational_responses),
+/// [HTTP/2](crate::server::conn::http2::Builder::informational_responses)).
 ///
 /// hyper inserts one into each request's extensions. Every [`send`](Self::send)
-/// writes `HTTP/1.1 <status> <reason>` plus the given headers to the client as
-/// soon as the connection can write. Sends after the final response head has
-/// been written are dropped.
-#[cfg(all(feature = "http1", feature = "server"))]
+/// writes the head (`HTTP/1.1 <status> <reason>` plus the given headers, or an
+/// HTTP/2 HEADERS frame) to the client as soon as the connection can write. Sends
+/// after the final response head has been written are dropped.
+#[cfg(all(any(feature = "http1", feature = "http2"), feature = "server"))]
 #[derive(Clone, Debug)]
 pub struct InformationalSender {
     tx: tokio::sync::mpsc::UnboundedSender<http::Response<()>>,
 }
 
-#[cfg(all(feature = "http1", feature = "server"))]
+#[cfg(all(any(feature = "http1", feature = "http2"), feature = "server"))]
 impl InformationalSender {
     /// Queues an interim head. Returns the response back when its status is not
     /// 1xx, is 101 Switching Protocols, or when the connection no longer accepts interim heads.
@@ -371,12 +372,12 @@ impl InformationalSender {
     }
 }
 
-#[cfg(all(feature = "http1", feature = "server"))]
+#[cfg(all(any(feature = "http1", feature = "http2"), feature = "server"))]
 pub(crate) struct InformationalReceiver {
     rx: tokio::sync::mpsc::UnboundedReceiver<http::Response<()>>,
 }
 
-#[cfg(all(feature = "http1", feature = "server"))]
+#[cfg(all(any(feature = "http1", feature = "http2"), feature = "server"))]
 impl InformationalReceiver {
     pub(crate) fn poll_recv(
         &mut self,
@@ -386,7 +387,7 @@ impl InformationalReceiver {
     }
 }
 
-#[cfg(all(feature = "http1", feature = "server"))]
+#[cfg(all(any(feature = "http1", feature = "http2"), feature = "server"))]
 pub(crate) fn informational_channel() -> (InformationalSender, InformationalReceiver) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (InformationalSender { tx }, InformationalReceiver { rx })

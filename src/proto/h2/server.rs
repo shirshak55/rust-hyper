@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures_core::ready;
 use h2::server::{Connection, Handshake, SendResponse};
 use h2::{Reason, RecvStream};
@@ -16,7 +16,7 @@ use crate::body::{Body, Incoming as IncomingBody};
 use crate::common::date;
 use crate::common::io::Compat;
 use crate::common::time::Time;
-use crate::ext::Protocol;
+use crate::ext::{InformationalReceiver, Protocol};
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
@@ -56,6 +56,7 @@ pub(crate) struct Config {
     pub(crate) header_table_size: Option<u32>,
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
+    pub(crate) informational: bool,
 }
 
 impl Default for Config {
@@ -75,6 +76,7 @@ impl Default for Config {
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
+            informational: false,
         }
     }
 }
@@ -90,6 +92,7 @@ pin_project! {
         service: S,
         state: State<T, B>,
         date_header: bool,
+        informational: bool,
         close_pending: bool
     }
 }
@@ -115,6 +118,7 @@ where
     conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
     date_header: bool,
+    informational: bool,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -178,6 +182,7 @@ where
             },
             service,
             date_header: config.date_header,
+            informational: config.informational,
             close_pending: false,
         }
     }
@@ -224,6 +229,7 @@ where
                         conn,
                         closing: None,
                         date_header: me.date_header,
+                        informational: me.informational,
                     })
                 }
                 State::Serving(srv) => {
@@ -306,11 +312,18 @@ where
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
 
+                        let informational = self.informational.then(|| {
+                            let (tx, rx) = crate::ext::informational_channel();
+                            req.extensions_mut().insert(tx);
+                            rx
+                        });
+
                         let fut = H2Stream::new(
                             service.call(req),
                             connect_parts,
                             respond,
                             self.date_header,
+                            informational,
                             exec.clone(),
                         );
 
@@ -369,6 +382,7 @@ pin_project! {
         #[pin]
         state: H2StreamState<F, B>,
         date_header: bool,
+        informational: Option<InformationalReceiver>,
         exec: E,
     }
 }
@@ -406,13 +420,31 @@ where
         connect_parts: Option<ConnectParts>,
         respond: SendResponse<SendBuf<B::Data>>,
         date_header: bool,
+        informational: Option<InformationalReceiver>,
         exec: E,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
             state: H2StreamState::Service { fut, connect_parts },
             date_header,
+            informational,
             exec,
+        }
+    }
+}
+
+/// Sends the interim (1xx) heads the service queued so far.
+fn send_informational<B: Buf>(
+    reply: &mut SendResponse<B>,
+    informational: &mut Option<InformationalReceiver>,
+    cx: &mut Context<'_>,
+) {
+    let Some(rx) = informational else {
+        return;
+    };
+    while let Poll::Ready(Some(res)) = rx.poll_recv(cx) {
+        if let Err(_e) = reply.send_informational(res) {
+            debug!("send informational error: {}", _e);
         }
     }
 }
@@ -450,6 +482,7 @@ where
                     let res = match h.poll(cx) {
                         Poll::Ready(Ok(r)) => r,
                         Poll::Pending => {
+                            send_informational(me.reply, me.informational, cx);
                             // Response is not yet ready, so we want to check if the client has sent a
                             // RST_STREAM frame which would cancel the current request.
                             if let Poll::Ready(reason) =
@@ -467,6 +500,10 @@ where
                             return Poll::Ready(Err(err));
                         }
                     };
+
+                    // Interim heads queued before the final response still precede it.
+                    send_informational(me.reply, me.informational, cx);
+                    *me.informational = None;
 
                     let (head, body) = res.into_parts();
                     let mut res = ::http::Response::from_parts(head, ());

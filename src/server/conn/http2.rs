@@ -299,6 +299,19 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Set whether services may relay interim (1xx) responses.
+    ///
+    /// When enabled, every request carries an
+    /// [`InformationalSender`](crate::ext::InformationalSender) extension; each
+    /// head sent through it goes to the client as an interim HEADERS frame, ahead
+    /// of the service's final response.
+    ///
+    /// Default is false.
+    pub fn informational_responses(&mut self, enabled: bool) -> &mut Self {
+        self.h2_builder.informational = enabled;
+        self
+    }
+
     /// Bind a connection together with a [`Service`](crate::service::Service).
     ///
     /// This returns a Future that must be polled in order for HTTP to be
