@@ -83,4 +83,13 @@ impl Response<'_> {
     pub fn headers(&self) -> &http::HeaderMap {
         self.0.headers()
     }
+
+    /// The head's extensions, such as its non-canonical
+    /// [`ReasonPhrase`](crate::ext::ReasonPhrase) and, when the connection preserves them,
+    /// its [`HeaderCaseMap`](crate::ext::HeaderCaseMap) and
+    /// [`OriginalHeaderOrder`](crate::ext::OriginalHeaderOrder).
+    #[inline]
+    pub fn extensions(&self) -> &http::Extensions {
+        self.0.extensions()
+    }
 }
