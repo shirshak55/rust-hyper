@@ -357,3 +357,8 @@ required-features = ["full"]
 name = "h1_shutdown_while_buffered"
 path = "tests/h1_shutdown_while_buffered.rs"
 required-features = ["full"]
+
+[patch.crates-io]
+# h2 fork carrying `h2::ext::HeaderOrder`, which the HTTP/2 server maps to and from
+# `OriginalHeaderOrder`.
+h2 = { git = "https://github.com/shirshak55/h2", branch = "wiremason" }

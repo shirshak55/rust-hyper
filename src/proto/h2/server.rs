@@ -16,6 +16,8 @@ use crate::body::{Body, Incoming as IncomingBody};
 use crate::common::date;
 use crate::common::io::Compat;
 use crate::common::time::Time;
+#[cfg(feature = "http1")]
+use crate::ext::OriginalHeaderOrder;
 use crate::ext::{InformationalReceiver, Protocol};
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
@@ -311,6 +313,8 @@ where
                         if let Some(protocol) = req.extensions_mut().remove::<h2::ext::Protocol>() {
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
+                        #[cfg(feature = "http1")]
+                        record_header_order(req.extensions_mut());
 
                         let informational = self.informational.then(|| {
                             let (tx, rx) = crate::ext::informational_channel();
@@ -433,6 +437,28 @@ where
     }
 }
 
+/// Records a received request's field order as the `OriginalHeaderOrder` the HTTP/1
+/// parser records, so a service sees repeats interleaved with other fields in place.
+#[cfg(feature = "http1")]
+fn record_header_order(extensions: &mut http::Extensions) {
+    if let Some(h2::ext::HeaderOrder(names)) = extensions.remove::<h2::ext::HeaderOrder>() {
+        let mut order = OriginalHeaderOrder::default();
+        for name in names {
+            order.append(name);
+        }
+        extensions.insert(order);
+    }
+}
+
+/// Encodes a response's fields in its `OriginalHeaderOrder`, as the HTTP/1 encoder does.
+#[cfg(feature = "http1")]
+fn apply_header_order(res: &mut http::Response<()>) {
+    if let Some(order) = res.extensions().get::<OriginalHeaderOrder>() {
+        let names = order.get_in_order().map(|(name, _)| name.clone()).collect();
+        res.extensions_mut().insert(h2::ext::HeaderOrder(names));
+    }
+}
+
 /// Sends the interim (1xx) heads the service queued so far.
 fn send_informational<B: Buf>(
     reply: &mut SendResponse<B>,
@@ -443,6 +469,10 @@ fn send_informational<B: Buf>(
         return;
     };
     while let Poll::Ready(Some(res)) = rx.poll_recv(cx) {
+        #[cfg(feature = "http1")]
+        let mut res = res;
+        #[cfg(feature = "http1")]
+        apply_header_order(&mut res);
         if let Err(_e) = reply.send_informational(res) {
             debug!("send informational error: {}", _e);
         }
@@ -507,6 +537,8 @@ where
 
                     let (head, body) = res.into_parts();
                     let mut res = ::http::Response::from_parts(head, ());
+                    #[cfg(feature = "http1")]
+                    apply_header_order(&mut res);
                     super::strip_connection_headers(
                         res.headers_mut(),
                         super::MessageKind::Response,
