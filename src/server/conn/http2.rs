@@ -312,6 +312,22 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Records the frames each client sends that shape its HTTP/2 fingerprint.
+    ///
+    /// Each connection logs the client's frames but `DATA`, in the order received, up to
+    /// `limit` of them: `SETTINGS` with every identifier and value as sent,
+    /// `WINDOW_UPDATE`, `PRIORITY`, `HEADERS` with their priority fields and pseudo-header
+    /// order, and the rest. Every request carries an
+    /// [`http2::HeadersFrame`](crate::ext::http2::HeadersFrame) extension with its own
+    /// `HEADERS` frame's stream, priority fields and pseudo-header order, and the
+    /// connection's [`FrameLog`](crate::ext::http2::FrameLog).
+    ///
+    /// Not recorded by default.
+    pub fn record_frames(&mut self, limit: usize) -> &mut Self {
+        self.h2_builder.record_frames = Some(limit);
+        self
+    }
+
     /// Bind a connection together with a [`Service`](crate::service::Service).
     ///
     /// This returns a Future that must be polled in order for HTTP to be

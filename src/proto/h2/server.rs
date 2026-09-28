@@ -59,6 +59,7 @@ pub(crate) struct Config {
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
     pub(crate) informational: bool,
+    pub(crate) record_frames: Option<usize>,
 }
 
 impl Default for Config {
@@ -79,6 +80,7 @@ impl Default for Config {
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
             informational: false,
+            record_frames: None,
         }
     }
 }
@@ -157,6 +159,9 @@ where
         }
         if config.enable_connect_protocol {
             builder.enable_connect_protocol();
+        }
+        if let Some(limit) = config.record_frames {
+            builder.record_frames(limit);
         }
         let handshake = builder.handshake(Compat::new(io));
 

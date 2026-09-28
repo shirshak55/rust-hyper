@@ -143,6 +143,13 @@ impl fmt::Debug for Protocol {
     }
 }
 
+/// How HTTP/2 clients sent their frames, as a server built with
+/// [`record_frames`](crate::server::conn::http2::Builder::record_frames) records them.
+#[cfg(all(feature = "http2", feature = "server"))]
+pub mod http2 {
+    pub use h2::ext::{FrameLog, HeadersFrame, LoggedFrame, PseudoHeader, StreamPriority};
+}
+
 /// A map from header names to their original casing as received in an HTTP message.
 ///
 /// If an HTTP/1 response `res` is parsed on a connection whose option

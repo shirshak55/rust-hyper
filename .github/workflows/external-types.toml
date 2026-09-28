@@ -12,4 +12,9 @@ allowed_external_types = [
     "http_body::Body",
     "http_body::frame::Frame",
     "http_body::size_hint::SizeHint",
+    "h2::ext::FrameLog",
+    "h2::ext::HeadersFrame",
+    "h2::ext::LoggedFrame",
+    "h2::ext::PseudoHeader",
+    "h2::ext::StreamPriority",
 ]

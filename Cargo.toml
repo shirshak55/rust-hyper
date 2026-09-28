@@ -360,5 +360,5 @@ required-features = ["full"]
 
 [patch.crates-io]
 # h2 fork carrying `h2::ext::HeaderOrder`, which the HTTP/2 server maps to and from
-# `OriginalHeaderOrder`.
+# `OriginalHeaderOrder`, and the client frame log `http2::Builder::record_frames` exposes.
 h2 = { git = "https://github.com/shirshak55/h2", branch = "wiremason" }
