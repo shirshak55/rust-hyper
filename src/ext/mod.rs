@@ -49,7 +49,7 @@ use http::header::HeaderName;
 use http::header::{HeaderMap, HeaderValue, IntoHeaderName, ValueIter};
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 use std::collections::HashMap;
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", all(feature = "client", feature = "http1")))]
 use std::fmt;
 #[cfg(all(
     any(feature = "client", feature = "server"),
@@ -368,6 +368,91 @@ impl Default for OriginalHeaderOrder {
 ))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, http::HeaderValue)>>>);
+
+/// A chunked HTTP/1 body's chunk-size lines as received, in order: each chunk's size and
+/// its line as sent (the size digits' spelling, any whitespace, and the chunk
+/// extensions, without the CRLF), the last chunk (size 0) included.
+///
+/// hyper inserts one into each chunked request a server connection built with
+/// [`preserve_chunks`](crate::server::conn::http1::Builder::preserve_chunks) reads, and
+/// into the chunked response to a client request marked with
+/// [`record_response_chunks`], and appends each line as it reads it, before the chunk's
+/// data. A chunked HTTP/1 message hyper writes carrying one splits its body at the
+/// recorded sizes and writes each recorded line, whatever frames the body yields, so a
+/// proxy relaying a received body keeps its chunks and their extensions; bytes past the
+/// record go out one chunk per frame, and a body ending inside a recorded chunk is an
+/// error. Clones share the lines, so a proxy can hand a received message's record (or its
+/// cell, to another HTTP library) to the message it relays as the lines arrive.
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Clone, Debug, Default)]
+pub struct RawChunks(pub Arc<std::sync::Mutex<Vec<(u64, Bytes)>>>);
+
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+impl RawChunks {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(u64, Bytes)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+impl PartialEq for RawChunks {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Marks a client request whose chunked response should carry a [`RawChunks`] record.
+#[cfg(all(feature = "client", feature = "http1"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordResponseChunks;
+
+/// Asks an HTTP/1 client connection to record the chunk-size lines of the response to
+/// `req` in a [`RawChunks`] extension on the response, if it is chunked.
+#[cfg(all(feature = "client", feature = "http1"))]
+pub fn record_response_chunks<B>(req: &mut http::Request<B>) {
+    req.extensions_mut().insert(RecordResponseChunks);
+}
+
+/// Makes an HTTP/1 client connection honour the `Expect: 100-continue` of the request
+/// carrying it: the connection writes the head, then holds the body back until the
+/// server answers `100 Continue` (passed to [`on_informational`] like any interim
+/// response) or `timeout` passes. A final response arriving first means the body is
+/// never sent, and the connection closes after that response.
+///
+/// Without this extension, or on a request without `Expect: 100-continue`, an empty
+/// body, or HTTP/1.0, the body follows the head at once.
+#[cfg(all(feature = "client", feature = "http1"))]
+#[derive(Clone)]
+pub struct ExpectContinue {
+    pub(crate) timer: Arc<dyn crate::rt::Timer + Send + Sync>,
+    pub(crate) timeout: std::time::Duration,
+}
+
+#[cfg(all(feature = "client", feature = "http1"))]
+impl ExpectContinue {
+    /// Waits for `100 Continue` up to `timeout`, measured by `timer` from when the head is
+    /// written (curl waits 1 second).
+    pub fn new<T>(timer: T, timeout: std::time::Duration) -> Self
+    where
+        T: crate::rt::Timer + Send + Sync + 'static,
+    {
+        Self {
+            timer: Arc::new(timer),
+            timeout,
+        }
+    }
+}
+
+#[cfg(all(feature = "client", feature = "http1"))]
+impl fmt::Debug for ExpectContinue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExpectContinue")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
 
 /// Sends interim (1xx) response heads to the client ahead of the service's final
 /// response, on an HTTP/1 or HTTP/2 connection built with `informational_responses`

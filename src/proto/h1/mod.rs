@@ -78,6 +78,9 @@ pub(crate) struct ParseContext<'a> {
     h09_responses: bool,
     #[cfg(feature = "client")]
     on_informational: &'a mut Option<crate::ext::OnInformational>,
+    /// The wait for `100 Continue` before a request body is sent, which a 100 ends.
+    #[cfg(feature = "client")]
+    expect_continue: &'a mut Option<std::pin::Pin<Box<dyn crate::rt::Sleep>>>,
 }
 
 /// Passed to `Http1Transaction::encode`.
@@ -90,6 +93,10 @@ pub(crate) struct Encode<'a, T> {
     title_case_headers: bool,
     #[cfg(feature = "server")]
     date_header: bool,
+    /// The client speaks HTTP/1.0, whatever version the response head says: no chunked
+    /// framing.
+    #[cfg(feature = "server")]
+    http10_peer: bool,
 }
 
 /// Extra flags that a request "wants", like expect-continue or upgrades.

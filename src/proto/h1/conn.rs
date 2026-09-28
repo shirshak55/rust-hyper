@@ -23,7 +23,7 @@ use crate::body::DecodedLength;
 use crate::common::time::Time;
 use crate::headers;
 use crate::proto::{BodyLength, MessageHead};
-#[cfg(feature = "server")]
+#[cfg(any(feature = "client", feature = "server"))]
 use crate::rt::Sleep;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -74,6 +74,12 @@ where
                 h09_responses: false,
                 #[cfg(feature = "client")]
                 on_informational: None,
+                #[cfg(feature = "client")]
+                expect_continue: None,
+                record_response_chunks: false,
+                auto_continue: true,
+                preserve_chunks: false,
+                preserve_response_version: false,
                 notify_read: false,
                 reading: Reading::Init,
                 writing: Writing::Init,
@@ -137,6 +143,21 @@ where
     #[cfg(feature = "server")]
     pub(crate) fn set_permissive_trailers(&mut self) {
         self.state.permissive_trailers = true;
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn disable_auto_continue(&mut self) {
+        self.state.auto_continue = false;
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_preserve_chunks(&mut self) {
+        self.state.preserve_chunks = true;
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_preserve_response_version(&mut self) {
+        self.state.preserve_response_version = true;
     }
     #[cfg(feature = "client")]
     pub(crate) fn set_preserve_header_order(&mut self) {
@@ -257,6 +278,8 @@ where
                 h09_responses: self.state.h09_responses,
                 #[cfg(feature = "client")]
                 on_informational: &mut self.state.on_informational,
+                #[cfg(feature = "client")]
+                expect_continue: &mut self.state.expect_continue,
             },
         ) {
             Poll::Ready(Ok(msg)) => msg,
@@ -298,6 +321,10 @@ where
         #[cfg(feature = "client")]
         {
             self.state.on_informational = None;
+            if self.state.expect_continue.take().is_some() {
+                debug!("final response before 100 Continue; not sending the request body");
+                self.state.close_write();
+            }
         }
 
         self.state.busy();
@@ -318,6 +345,14 @@ where
             } else {
                 None
             };
+        let raw_chunks = if self.state.records_chunks::<T>() && msg.decode == DecodedLength::CHUNKED
+        {
+            let raw = crate::ext::RawChunks::default();
+            msg.head.extensions.insert(raw.clone());
+            Some(raw)
+        } else {
+            None
+        };
 
         if msg.decode == DecodedLength::ZERO {
             if msg.expect_continue {
@@ -331,14 +366,16 @@ where
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
             self.state.reading = Reading::Continue(
                 Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
-                    .with_raw_trailers(raw_trailers),
+                    .with_raw_trailers(raw_trailers)
+                    .with_raw_chunks(raw_chunks),
             );
             wants = wants.add(Wants::EXPECT);
         } else {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
             self.state.reading = Reading::Body(
                 Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
-                    .with_raw_trailers(raw_trailers),
+                    .with_raw_trailers(raw_trailers)
+                    .with_raw_chunks(raw_chunks),
             );
         }
 
@@ -421,7 +458,7 @@ where
             }
             Reading::Continue(decoder) => {
                 // Write the 100 Continue if not already responded...
-                if let Writing::Init = self.state.writing {
+                if matches!(self.state.writing, Writing::Init) && self.state.auto_continue {
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
                     self.io.headers_buf().extend_from_slice(cont);
@@ -614,14 +651,17 @@ where
     /// when the connection can't write a head right now (a head is already in
     /// progress, or the write buffer is backed up), when the client speaks
     /// HTTP/1.0 (RFC 9110 §15.2: no 1xx to a 1.0 client), or for `100 Continue`
-    /// (the connection writes its own on `Expect: 100-continue`).
+    /// unless `auto_continue` is off (the connection writes its own on
+    /// `Expect: 100-continue`).
     #[cfg(feature = "server")]
     pub(crate) fn write_informational(&mut self, head: MessageHead<http::StatusCode>) {
         if !self.can_write_head() {
             debug!("dropping informational response: cannot write a head now");
             return;
         }
-        if self.state.version == Version::HTTP_10 || head.subject == http::StatusCode::CONTINUE {
+        if self.state.version == Version::HTTP_10
+            || (head.subject == http::StatusCode::CONTINUE && self.state.auto_continue)
+        {
             debug!(
                 "dropping informational response {} for HTTP/1.0 client or 100 Continue",
                 head.subject
@@ -663,10 +703,29 @@ where
                 self.state.disable_keep_alive();
             }
         }
+        // An HTTP/1.0 request without `Connection: keep-alive` asks the server to close
+        // after its response, whatever version that response says.
+        let http10_close = !T::should_read_first()
+            && head.version == Version::HTTP_10
+            && !head
+                .headers
+                .get_all(CONNECTION)
+                .iter()
+                .any(headers::connection_keep_alive);
+        #[cfg(feature = "client")]
+        let expects_continue = head.version != Version::HTTP_10
+            && head
+                .headers
+                .get(http::header::EXPECT)
+                .map_or(false, |v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
 
         self.enforce_version(&mut head);
+        if http10_close {
+            self.state.disable_keep_alive();
+        }
 
         let raw_trailers = head.extensions.get::<crate::ext::RawTrailers>().cloned();
+        let raw_chunks = head.extensions.get::<crate::ext::RawChunks>().cloned();
         let buf = self.io.headers_buf();
         match super::role::encode_headers::<T>(
             Encode {
@@ -678,6 +737,8 @@ where
                 title_case_headers: self.state.title_case_headers,
                 #[cfg(feature = "server")]
                 date_header: self.state.date_header,
+                #[cfg(feature = "server")]
+                http10_peer: self.state.version == Version::HTTP_10,
             },
             buf,
         ) {
@@ -690,9 +751,22 @@ where
                 {
                     self.state.on_informational =
                         head.extensions.remove::<crate::ext::OnInformational>();
+                    self.state.record_response_chunks = head
+                        .extensions
+                        .remove::<crate::ext::RecordResponseChunks>()
+                        .is_some();
+                    self.state.expect_continue = head
+                        .extensions
+                        .remove::<crate::ext::ExpectContinue>()
+                        .filter(|_| expects_continue && !encoder.is_eof())
+                        .map(|expect| expect.timer.sleep(expect.timeout));
                 }
 
-                Some(encoder.with_raw_trailers(raw_trailers))
+                Some(
+                    encoder
+                        .with_raw_trailers(raw_trailers)
+                        .with_raw_chunks(raw_chunks),
+                )
             }
             Err(err) => {
                 self.state.error = Some(err);
@@ -731,6 +805,18 @@ where
     // to work with our older peer.
     fn enforce_version(&mut self, head: &mut MessageHead<T::Outgoing>) {
         match self.state.version {
+            Version::HTTP_10 if self.state.preserve_response_version => {
+                // The response keeps its version; the connection persists only when the
+                // response asks for it, as HTTP/1.0 has it.
+                if !head
+                    .headers
+                    .get_all(CONNECTION)
+                    .iter()
+                    .any(headers::connection_keep_alive)
+                {
+                    self.state.disable_keep_alive();
+                }
+            }
             Version::HTTP_10 => {
                 // Fixes response or connection when keep-alive header is not present
                 self.fix_keep_alive(head);
@@ -776,15 +862,31 @@ where
         self.state.writing = state;
     }
 
-    pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) {
+    /// Waits until a request body held back for `100 Continue` may be sent: the 100 came,
+    /// or the wait timed out.
+    #[cfg(feature = "client")]
+    pub(crate) fn poll_expect_continue(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(wait) = &mut self.state.expect_continue {
+            ready!(wait.as_mut().poll(cx));
+            debug!("no 100 Continue before the timeout; sending the request body");
+            self.state.expect_continue = None;
+        }
+        Poll::Ready(())
+    }
+
+    pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) -> crate::Result<()> {
         if T::is_server() && !self.state.allow_trailer_fields && !self.state.permissive_trailers {
             debug!("trailers not allowed to be sent");
-            return;
+            return Ok(());
         }
         debug_assert!(self.can_write_body() && self.can_buffer_body());
 
         match &mut self.state.writing {
             Writing::Body(encoder) => {
+                if let Err(not_eof) = encoder.check_raw_chunks_complete() {
+                    self.state.writing = Writing::Closed;
+                    return Err(crate::Error::new_body_write_aborted().with(not_eof));
+                }
                 if let Some(enc_buf) = encoder.encode_trailers(
                     trailers,
                     self.state.title_case_headers,
@@ -801,12 +903,18 @@ where
             }
             _ => unreachable!("write_trailers invalid state: {:?}", self.state.writing),
         }
+        Ok(())
     }
 
-    pub(crate) fn write_body_and_end(&mut self, chunk: B) {
+    pub(crate) fn write_body_and_end(&mut self, chunk: B) -> crate::Result<()> {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
         // empty chunks should be discarded at Dispatcher level
         debug_assert!(chunk.remaining() != 0);
+
+        if matches!(&self.state.writing, Writing::Body(encoder) if encoder.has_raw_chunks()) {
+            self.write_body(chunk);
+            return self.end_body();
+        }
 
         let state = match &mut self.state.writing {
             Writing::Body(encoder) => {
@@ -821,6 +929,7 @@ where
         };
 
         self.state.writing = state;
+        Ok(())
     }
 
     pub(crate) fn end_body(&mut self) -> crate::Result<()> {
@@ -1000,6 +1109,18 @@ struct State {
     /// received.
     #[cfg(feature = "client")]
     on_informational: Option<crate::ext::OnInformational>,
+    /// While set, the request body waits for `100 Continue` until this sleep ends.
+    #[cfg(feature = "client")]
+    expect_continue: Option<Pin<Box<dyn Sleep>>>,
+    /// Record the chunk-size lines of the current request's chunked response.
+    record_response_chunks: bool,
+    /// Write `100 Continue` when a request body sent with `Expect: 100-continue` is
+    /// first read.
+    auto_continue: bool,
+    /// Record the chunk-size lines of chunked requests.
+    preserve_chunks: bool,
+    /// Keep a response's version when the client speaks HTTP/1.0.
+    preserve_response_version: bool,
     /// Set to true when the Dispatcher should poll read operations
     /// again. See the `maybe_notify` method for more.
     notify_read: bool,
@@ -1125,6 +1246,15 @@ impl State {
 
     fn wants_keep_alive(&self) -> bool {
         !matches!(self.keep_alive.status(), KA::Disabled)
+    }
+
+    /// Whether the message being read records its chunk-size lines.
+    fn records_chunks<T: Http1Transaction>(&self) -> bool {
+        if T::is_server() {
+            self.preserve_chunks
+        } else {
+            self.record_response_chunks
+        }
     }
 
     fn try_keep_alive<T: Http1Transaction>(&mut self) {

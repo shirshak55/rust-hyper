@@ -868,6 +868,7 @@ impl Server {
                     }
                     // check that we actually can send a chunked body...
                     if msg.head.version == Version::HTTP_10
+                        || msg.http10_peer
                         || !Server::can_chunked(msg.req_method.as_ref(), msg.head.subject)
                     {
                         continue;
@@ -917,6 +918,7 @@ impl Server {
                 header::TRAILER => {
                     // check that we actually can send a chunked body...
                     if msg.head.version == Version::HTTP_10
+                        || msg.http10_peer
                         || !Server::can_chunked(msg.req_method.as_ref(), msg.head.subject)
                     {
                         continue;
@@ -978,6 +980,7 @@ impl Server {
             encoder = match msg.body {
                 Some(BodyLength::Unknown) => {
                     if msg.head.version == Version::HTTP_10
+                        || msg.http10_peer
                         || !Server::can_chunked(msg.req_method.as_ref(), msg.head.subject)
                     {
                         Encoder::close_delimited()
@@ -1236,6 +1239,10 @@ impl Http1Transaction for Client {
             }
 
             if head.subject.is_informational() {
+                if head.subject == StatusCode::CONTINUE {
+                    // The server wants the body a request with `Expect: 100-continue` holds back.
+                    *ctx.expect_continue = None;
+                }
                 if let Some(callback) = ctx.on_informational {
                     callback.call(head.into_response(()));
                 }
@@ -1825,6 +1832,8 @@ mod tests {
                 h09_responses: false,
                 #[cfg(feature = "client")]
                 on_informational: &mut None,
+                #[cfg(feature = "client")]
+                expect_continue: &mut None,
             },
         )
         .unwrap()
@@ -1852,6 +1861,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         let msg = Client::parse(&mut raw, ctx).unwrap().unwrap();
         assert_eq!(raw.len(), 0);
@@ -1875,6 +1886,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         Server::parse(&mut raw, ctx).unwrap_err();
     }
@@ -1895,6 +1908,8 @@ mod tests {
             h09_responses: true,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         let msg = Client::parse(&mut raw, ctx).unwrap().unwrap();
         assert_eq!(raw, H09_RESPONSE);
@@ -1917,6 +1932,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         Client::parse(&mut raw, ctx).unwrap_err();
         assert_eq!(raw, H09_RESPONSE);
@@ -1943,6 +1960,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         let msg = Client::parse(&mut raw, ctx).unwrap().unwrap();
         assert_eq!(raw.len(), 0);
@@ -1966,6 +1985,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         Client::parse(&mut raw, ctx).unwrap_err();
     }
@@ -1993,6 +2014,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         let msg = Server::parse(&mut raw, ctx).unwrap().unwrap();
         assert_eq!(raw.len(), 0);
@@ -2019,6 +2042,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         Server::parse(&mut raw, ctx).unwrap_err();
     }
@@ -2038,6 +2063,8 @@ mod tests {
             h09_responses: false,
             #[cfg(feature = "client")]
             on_informational: &mut None,
+            #[cfg(feature = "client")]
+            expect_continue: &mut None,
         };
         let parsed_message = Server::parse(&mut raw, ctx).unwrap().unwrap();
         let orig_headers = parsed_message
@@ -2076,6 +2103,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 },
             )
             .expect("parse ok")
@@ -2096,6 +2125,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 },
             )
             .expect_err(comment)
@@ -2335,6 +2366,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 }
             )
             .expect("parse ok")
@@ -2355,6 +2388,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 },
             )
             .expect("parse ok")
@@ -2375,6 +2410,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 },
             )
             .expect_err("parse should err")
@@ -2681,6 +2718,8 @@ mod tests {
                 title_case_headers: true,
                 #[cfg(feature = "server")]
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2715,6 +2754,8 @@ mod tests {
                 title_case_headers: false,
                 #[cfg(feature = "server")]
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2752,6 +2793,8 @@ mod tests {
                 title_case_headers: true,
                 #[cfg(feature = "server")]
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2778,6 +2821,8 @@ mod tests {
                 req_method: &mut Some(Method::CONNECT),
                 title_case_headers: false,
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2809,6 +2854,8 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: true,
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2845,6 +2892,8 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: false,
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2881,6 +2930,8 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: true,
                 date_header: true,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2918,6 +2969,8 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: true,
                 date_header: false,
+                #[cfg(feature = "server")]
+                http10_peer: false,
             },
             &mut vec,
         )
@@ -2944,6 +2997,8 @@ mod tests {
                 h09_responses: false,
                 #[cfg(feature = "client")]
                 on_informational: &mut None,
+                #[cfg(feature = "client")]
+                expect_continue: &mut None,
             },
         )
         .expect("parse ok")
@@ -2987,6 +3042,8 @@ mod tests {
                         h09_responses: false,
                         #[cfg(feature = "client")]
                         on_informational: &mut None,
+                        #[cfg(feature = "client")]
+                        expect_continue: &mut None,
                     },
                 );
                 if should_success {
@@ -3010,6 +3067,8 @@ mod tests {
                         h09_responses: false,
                         #[cfg(feature = "client")]
                         on_informational: &mut None,
+                        #[cfg(feature = "client")]
+                        expect_continue: &mut None,
                     },
                 );
                 if should_success {
@@ -3129,6 +3188,8 @@ mod tests {
                 h09_responses: false,
                 #[cfg(feature = "client")]
                 on_informational: &mut None,
+                #[cfg(feature = "client")]
+                expect_continue: &mut None,
             },
         )
         .expect("parse ok")
@@ -3211,6 +3272,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 },
             )
             .unwrap()
@@ -3255,6 +3318,8 @@ mod tests {
                     h09_responses: false,
                     #[cfg(feature = "client")]
                     on_informational: &mut None,
+                    #[cfg(feature = "client")]
+                    expect_continue: &mut None,
                 },
             )
             .unwrap()
@@ -3298,6 +3363,8 @@ mod tests {
                     req_method: &mut Some(Method::GET),
                     title_case_headers: false,
                     date_header: true,
+                    #[cfg(feature = "server")]
+                    http10_peer: false,
                 },
                 &mut vec,
             )
@@ -3327,6 +3394,8 @@ mod tests {
                     req_method: &mut Some(Method::GET),
                     title_case_headers: false,
                     date_header: true,
+                    #[cfg(feature = "server")]
+                    http10_peer: false,
                 },
                 &mut vec,
             )

@@ -78,6 +78,9 @@ pub struct Builder {
     h1_preserve_header_case: bool,
     h1_informational: bool,
     h1_permissive_trailers: bool,
+    h1_auto_continue: bool,
+    h1_preserve_chunks: bool,
+    h1_preserve_response_version: bool,
     h1_max_headers: Option<usize>,
     h1_header_read_timeout: Dur,
     h1_writev: Option<bool>,
@@ -250,6 +253,9 @@ impl Builder {
             h1_preserve_header_case: false,
             h1_informational: false,
             h1_permissive_trailers: false,
+            h1_auto_continue: true,
+            h1_preserve_chunks: false,
+            h1_preserve_response_version: false,
             h1_max_headers: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
             h1_writev: None,
@@ -346,6 +352,47 @@ impl Builder {
     /// Default is false (RFC 9110 behavior).
     pub fn permissive_trailers(&mut self, enabled: bool) -> &mut Self {
         self.h1_permissive_trailers = enabled;
+        self
+    }
+
+    /// Set whether the connection answers a request's `Expect: 100-continue` with
+    /// `100 Continue` itself, when the service first reads the request body.
+    ///
+    /// When disabled, the connection never writes a 100 on its own: the service sends one
+    /// through the request's [`InformationalSender`](crate::ext::InformationalSender)
+    /// (see [`informational_responses`](Self::informational_responses)) when it wants the
+    /// body, e.g. relaying an origin's, and the client decides when to send the body
+    /// without one.
+    ///
+    /// Default is true.
+    pub fn auto_continue(&mut self, enabled: bool) -> &mut Self {
+        self.h1_auto_continue = enabled;
+        self
+    }
+
+    /// Set whether chunked request bodies record their chunk-size lines.
+    ///
+    /// When enabled, each chunked request carries a [`RawChunks`](crate::ext::RawChunks)
+    /// extension filled with its chunks' sizes and lines, extensions included, as they are
+    /// read. A chunked response carrying one is written at its chunk sizes with its lines,
+    /// whether or not this is enabled.
+    ///
+    /// Default is false.
+    pub fn preserve_chunks(&mut self, enabled: bool) -> &mut Self {
+        self.h1_preserve_chunks = enabled;
+        self
+    }
+
+    /// Set whether a response to an HTTP/1.0 client keeps the version its head says.
+    ///
+    /// hyper otherwise writes every response to an HTTP/1.0 client as `HTTP/1.0`. When
+    /// enabled, a response saying HTTP/1.1 (as an origin answers a 1.0 request) is
+    /// written as such, still framed for HTTP/1.0 (no chunked coding), and the connection
+    /// persists only when the response carries `Connection: keep-alive`.
+    ///
+    /// Default is false.
+    pub fn preserve_response_version(&mut self, enabled: bool) -> &mut Self {
+        self.h1_preserve_response_version = enabled;
         self
     }
 
@@ -501,6 +548,15 @@ impl Builder {
         }
         if self.h1_permissive_trailers {
             conn.set_permissive_trailers();
+        }
+        if !self.h1_auto_continue {
+            conn.disable_auto_continue();
+        }
+        if self.h1_preserve_chunks {
+            conn.set_preserve_chunks();
+        }
+        if self.h1_preserve_response_version {
+            conn.set_preserve_response_version();
         }
         if let Some(max_headers) = self.h1_max_headers {
             conn.set_http1_max_headers(max_headers);
