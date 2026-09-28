@@ -532,7 +532,7 @@ where
 
         let send_stream = if !f.is_connect {
             if !f.eos {
-                let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
+                let mut pipe = PipeToSendStream::new(f.body, f.body_tx, None);
 
                 // eagerly see if the body pipe is ready and
                 // can thus skip allocating in the executor
@@ -650,7 +650,7 @@ where
                 } else {
                     let res = res.map(|stream| {
                         let ping = ping.for_stream(&stream);
-                        IncomingBody::h2(stream, content_length.into(), ping)
+                        IncomingBody::h2(stream, content_length.into(), ping, None)
                     });
                     Poll::Ready(Ok(res))
                 }

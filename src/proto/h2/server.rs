@@ -18,7 +18,7 @@ use crate::common::io::Compat;
 use crate::common::time::Time;
 #[cfg(feature = "http1")]
 use crate::ext::OriginalHeaderOrder;
-use crate::ext::{InformationalReceiver, Protocol};
+use crate::ext::{InformationalReceiver, Protocol, RawTrailers};
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
@@ -284,10 +284,21 @@ where
                         let is_connect = req.method() == Method::CONNECT;
                         let (mut parts, stream) = req.into_parts();
                         let (mut req, connect_parts) = if !is_connect {
+                            // Trailers may follow a body; record their field order.
+                            let raw_trailers = (!stream.is_end_stream()).then(|| {
+                                let raw = RawTrailers::default();
+                                parts.extensions.insert(raw.clone());
+                                raw
+                            });
                             (
                                 Request::from_parts(
                                     parts,
-                                    IncomingBody::h2(stream, content_length.into(), ping),
+                                    IncomingBody::h2(
+                                        stream,
+                                        content_length.into(),
+                                        ping,
+                                        raw_trailers,
+                                    ),
                                 ),
                                 None,
                             )
@@ -587,9 +598,10 @@ where
                             headers::set_content_length_if_missing(res.headers_mut(), len);
                         }
 
+                        let raw_trailers = res.extensions().get::<RawTrailers>().cloned();
                         let body_tx = reply!(me, res, false);
                         H2StreamState::Body {
-                            pipe: PipeToSendStream::new(body, body_tx),
+                            pipe: PipeToSendStream::new(body, body_tx, raw_trailers),
                         }
                     } else {
                         reply!(me, res, true);

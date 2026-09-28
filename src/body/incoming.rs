@@ -26,6 +26,8 @@ use super::DecodedLength;
 #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
 use crate::common::watch;
 #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
+use crate::ext::RawTrailers;
+#[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
 use crate::proto::h2::ping;
 
 #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
@@ -68,6 +70,7 @@ enum Kind {
         data_done: bool,
         ping: ping::Recorder,
         recv: h2::RecvStream,
+        raw_trailers: Option<RawTrailers>,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -155,6 +158,7 @@ impl Incoming {
         recv: h2::RecvStream,
         mut content_length: DecodedLength,
         ping: ping::Recorder,
+        raw_trailers: Option<RawTrailers>,
     ) -> Self {
         // If the stream is already EOS, then the "unknown length" is clearly
         // actually ZERO.
@@ -167,6 +171,7 @@ impl Incoming {
             ping,
             content_length,
             recv,
+            raw_trailers,
         })
     }
 
@@ -235,6 +240,7 @@ impl Body for Incoming {
                 ping,
                 recv: h2,
                 content_length: len,
+                raw_trailers,
             } => {
                 if !*data_done {
                     match ready!(h2.poll_data(cx)) {
@@ -262,10 +268,16 @@ impl Body for Incoming {
                 }
 
                 // after data, check trailers
-                match ready!(h2.poll_trailers(cx)) {
+                match ready!(h2.poll_trailers_with_order(cx)) {
                     Ok(t) => {
                         ping.record_non_data();
-                        Poll::Ready(Ok(t.map(Frame::trailers)).transpose())
+                        let t = t.map(|(trailers, order)| {
+                            if let Some(raw) = raw_trailers {
+                                crate::proto::h2::record_trailers(raw, &trailers, order);
+                            }
+                            Frame::trailers(trailers)
+                        });
+                        Poll::Ready(Ok(t).transpose())
                     }
                     Err(e) => {
                         if let Some(h2::Reason::NO_ERROR) = e.reason() {
@@ -467,7 +479,7 @@ mod tests {
         // the size by too much.
 
         let body_size = mem::size_of::<Incoming>();
-        let body_expected_size = mem::size_of::<u64>() * 5;
+        let body_expected_size = mem::size_of::<u64>() * 6;
         assert!(
             body_size <= body_expected_size,
             "Body size = {} <= {}",

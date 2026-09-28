@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::io::{Cursor, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use futures_core::ready;
 use h2::SendStream;
 use http::header::{HeaderName, CONNECTION, TRANSFER_ENCODING, UPGRADE};
@@ -12,6 +13,7 @@ use http::HeaderMap;
 use pin_project_lite::pin_project;
 
 use crate::body::Body;
+use crate::ext::RawTrailers;
 
 pub(crate) mod ping;
 pub(crate) mod upgrade;
@@ -115,6 +117,8 @@ pin_project! {
         // it survives across `Poll::Pending` returns from `poll_capacity`; if
         // we left the chunk in a local, it would be dropped on every repoll.
         buffered_data: Option<Peeked<S::Data>>,
+        // The trailer field order to send the body's trailers in, once recorded.
+        raw_trailers: Option<RawTrailers>,
         #[pin]
         stream: S,
     }
@@ -129,11 +133,16 @@ impl<S> PipeToSendStream<S>
 where
     S: Body,
 {
-    fn new(stream: S, tx: SendStream<SendBuf<S::Data>>) -> PipeToSendStream<S> {
+    fn new(
+        stream: S,
+        tx: SendStream<SendBuf<S::Data>>,
+        raw_trailers: Option<RawTrailers>,
+    ) -> PipeToSendStream<S> {
         PipeToSendStream {
             body_tx: tx,
             data_done: false,
             buffered_data: None,
+            raw_trailers,
             stream,
         }
     }
@@ -251,7 +260,10 @@ where
                         // no more DATA, so give any capacity back
                         me.body_tx.reserve_capacity(0);
                         me.body_tx
-                            .send_trailers(frame.into_trailers().unwrap_or_else(|_| unreachable!()))
+                            .send_trailers_with_order(
+                                frame.into_trailers().unwrap_or_else(|_| unreachable!()),
+                                trailer_order(me.raw_trailers.as_ref()),
+                            )
                             .map_err(crate::Error::new_body_write)?;
                         return Poll::Ready(Ok(()));
                     } else {
@@ -294,6 +306,39 @@ impl<B: Buf> SendStreamExt for SendStream<SendBuf<B>> {
         self.send_data(SendBuf::None, true)
             .map_err(crate::Error::new_body_write)
     }
+}
+
+/// Records `trailers` into `raw` in the field order h2 decoded them in, each listed name
+/// taking the next value of that name.
+pub(crate) fn record_trailers(
+    raw: &RawTrailers,
+    trailers: &HeaderMap,
+    order: h2::ext::HeaderOrder,
+) {
+    let mut values = HashMap::new();
+    let fields = order
+        .0
+        .into_iter()
+        .filter_map(|name| {
+            let value = values
+                .entry(name.clone())
+                .or_insert_with_key(|name| trailers.get_all(name).iter())
+                .next()?
+                .clone();
+            Some((Bytes::copy_from_slice(name.as_str().as_bytes()), value))
+        })
+        .collect();
+    raw.0.get_or_init(|| fields);
+}
+
+/// The field order `raw` recorded, once it has, to send trailers in.
+fn trailer_order(raw: Option<&RawTrailers>) -> h2::ext::HeaderOrder {
+    let fields = raw.and_then(|raw| raw.0.get()).into_iter().flatten();
+    h2::ext::HeaderOrder(
+        fields
+            .filter_map(|(name, _)| HeaderName::from_bytes(name).ok())
+            .collect(),
+    )
 }
 
 #[repr(usize)]

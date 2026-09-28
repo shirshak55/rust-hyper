@@ -35,7 +35,10 @@
 //!
 //! See the documentation on each item for details about its usage and requirements.
 
-#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[cfg(all(
+    any(feature = "client", feature = "server"),
+    any(feature = "http1", feature = "http2")
+))]
 use bytes::Bytes;
 #[cfg(any(
     all(any(feature = "client", feature = "server"), feature = "http1"),
@@ -48,7 +51,10 @@ use http::header::{HeaderMap, HeaderValue, IntoHeaderName, ValueIter};
 use std::collections::HashMap;
 #[cfg(feature = "http2")]
 use std::fmt;
-#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[cfg(all(
+    any(feature = "client", feature = "server"),
+    any(feature = "http1", feature = "http2")
+))]
 use std::sync::{Arc, OnceLock};
 
 #[cfg(any(feature = "http1", feature = "ffi"))]
@@ -346,17 +352,22 @@ impl Default for OriginalHeaderOrder {
     }
 }
 
-/// An HTTP/1 chunked message's trailer fields in the order received, each name spelled
-/// as sent, which the trailers `HeaderMap` its body yields lowercases and groups.
+/// A message's trailer fields in the order received, each name spelled as sent (lowercase
+/// over HTTP/2), which the trailers `HeaderMap` its body yields lowercases and groups.
 ///
-/// With `preserve_header_case`, hyper inserts one into each chunked message it reads and
-/// fills it as it reads the trailers, before the body yields them. A message hyper writes
-/// carrying a filled one sends its trailers in that spelling and order. Clones share the
-/// fields, so a proxy can hand a received message's record (or its cell, to another HTTP
-/// library) to the message it relays before the trailers arrive.
-#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+/// hyper inserts one into each chunked HTTP/1 message it reads with
+/// `preserve_header_case`, and the HTTP/2 server into each request with a body, and fills
+/// it as it reads the trailers, before the body yields them. An HTTP/1 message hyper writes, or a
+/// response the HTTP/2 server sends, carrying a filled one sends its trailers in that
+/// spelling and order. Clones share the fields, so a proxy can hand a received message's
+/// record (or its cell, to another HTTP library) to the message it relays before the
+/// trailers arrive.
+#[cfg(all(
+    any(feature = "client", feature = "server"),
+    any(feature = "http1", feature = "http2")
+))]
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, HeaderValue)>>>);
+pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, http::HeaderValue)>>>);
 
 /// Sends interim (1xx) response heads to the client ahead of the service's final
 /// response, on an HTTP/1 or HTTP/2 connection built with `informational_responses`
