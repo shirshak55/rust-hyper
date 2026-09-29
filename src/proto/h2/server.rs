@@ -60,6 +60,7 @@ pub(crate) struct Config {
     pub(crate) date_header: bool,
     pub(crate) informational: bool,
     pub(crate) record_frames: Option<usize>,
+    pub(crate) deferred_preface: Option<h2::ext::DeferredPreface>,
 }
 
 impl Default for Config {
@@ -81,6 +82,7 @@ impl Default for Config {
             date_header: true,
             informational: false,
             record_frames: None,
+            deferred_preface: None,
         }
     }
 }
@@ -162,6 +164,9 @@ where
         }
         if let Some(limit) = config.record_frames {
             builder.record_frames(limit);
+        }
+        if let Some(preface) = config.deferred_preface.clone() {
+            builder.deferred_preface(preface);
         }
         let handshake = builder.handshake(Compat::new(io));
 

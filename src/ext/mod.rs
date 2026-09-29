@@ -147,7 +147,10 @@ impl fmt::Debug for Protocol {
 /// [`record_frames`](crate::server::conn::http2::Builder::record_frames) records them.
 #[cfg(all(feature = "http2", feature = "server"))]
 pub mod http2 {
-    pub use h2::ext::{FrameLog, HeadersFrame, LoggedFrame, PseudoHeader, StreamPriority};
+    pub use h2::ext::{
+        deferred_preface, DeferredPreface, FrameLog, HeadersFrame, LoggedFrame, PrefaceFrame,
+        PrefaceSender, PseudoHeader, StreamPriority,
+    };
 }
 
 /// A map from header names to their original casing as received in an HTTP message.
