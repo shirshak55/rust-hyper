@@ -340,6 +340,17 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Leaves closing the connection to the client once it sent a `GOAWAY`: the connection
+    /// stays open, sending no `GOAWAY` of its own, after the client's streams are done,
+    /// until the client closes it. Lets an intermediary relaying the client's `GOAWAY` leave
+    /// its answer to the server it relays to.
+    ///
+    /// By default the connection answers with its own `GOAWAY` and closes.
+    pub fn leave_close_to_client(&mut self) -> &mut Self {
+        self.h2_builder.leave_close_to_client = true;
+        self
+    }
+
     /// Bind a connection together with a [`Service`](crate::service::Service).
     ///
     /// This returns a Future that must be polled in order for HTTP to be

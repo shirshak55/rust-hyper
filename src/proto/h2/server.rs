@@ -64,6 +64,7 @@ pub(crate) struct Config {
     pub(crate) informational: bool,
     pub(crate) record_frames: Option<usize>,
     pub(crate) deferred_preface: Option<h2::ext::DeferredPreface>,
+    pub(crate) leave_close_to_client: bool,
 }
 
 impl Default for Config {
@@ -86,6 +87,7 @@ impl Default for Config {
             informational: false,
             record_frames: None,
             deferred_preface: None,
+            leave_close_to_client: false,
         }
     }
 }
@@ -170,6 +172,9 @@ where
         }
         if let Some(preface) = config.deferred_preface.clone() {
             builder.deferred_preface(preface);
+        }
+        if config.leave_close_to_client {
+            builder.leave_close_to_client();
         }
         let handshake = builder.handshake(Compat::new(io));
 
