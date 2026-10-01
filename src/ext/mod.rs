@@ -512,3 +512,71 @@ pub(crate) fn informational_channel() -> (InformationalSender, InformationalRece
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (InformationalSender { tx }, InformationalReceiver { rx })
 }
+
+/// The pushes, as they come, an HTTP/2 server promises (RFC 9113 §8.4) on the stream of the
+/// response whose extensions carry them.
+#[cfg(all(feature = "http2", feature = "server"))]
+pub(crate) type Http2PushStream<B> =
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = Http2Push<B>> + Send>>;
+
+/// HTTP/2 server pushes (RFC 9113 §8.4) to promise on the stream of the response whose
+/// extensions carry them. hyper promises each as it comes while that stream is open, and
+/// sends its response from a task of its own; the stream ends only once the pushes have,
+/// so that every promise precedes its end. A push the client can't take (it disabled push)
+/// is dropped.
+#[cfg(all(feature = "http2", feature = "server"))]
+pub struct Http2Pushes<B>(Arc<std::sync::Mutex<Option<Http2PushStream<B>>>>);
+
+#[cfg(all(feature = "http2", feature = "server"))]
+impl<B> Http2Pushes<B> {
+    /// The pushes `pushes` yields.
+    pub fn new(pushes: impl futures_core::Stream<Item = Http2Push<B>> + Send + 'static) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(Box::pin(pushes)))))
+    }
+
+    pub(crate) fn take(&self) -> Option<Http2PushStream<B>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+#[cfg(all(feature = "http2", feature = "server"))]
+impl<B> Clone for Http2Pushes<B> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(all(feature = "http2", feature = "server"))]
+impl<B> fmt::Debug for Http2Pushes<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Http2Pushes").finish_non_exhaustive()
+    }
+}
+
+/// A push to promise (see [`Http2Pushes`]).
+#[cfg(all(feature = "http2", feature = "server"))]
+pub struct Http2Push<B> {
+    /// The promised request's head.
+    pub request: http::Request<()>,
+    /// Its response; an error resets the pushed stream, and the client resetting it drops
+    /// the response.
+    pub response: std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<http::Response<B>, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send,
+        >,
+    >,
+}
+
+#[cfg(all(feature = "http2", feature = "server"))]
+impl<B> fmt::Debug for Http2Push<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Http2Push")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
+}

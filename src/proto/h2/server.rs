@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use futures_core::ready;
-use h2::server::{Connection, Handshake, SendResponse};
+use h2::server::{Connection, Handshake, SendPushedResponse, SendResponse};
 use h2::{Reason, RecvStream};
 use http::{Method, Request};
 use pin_project_lite::pin_project;
@@ -18,11 +18,11 @@ use crate::common::io::Compat;
 use crate::common::time::Time;
 #[cfg(feature = "http1")]
 use crate::ext::OriginalHeaderOrder;
-use crate::ext::{InformationalReceiver, Protocol, RawTrailers};
+use crate::ext::{Http2PushStream, Http2Pushes, InformationalReceiver, Protocol, RawTrailers};
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
-use crate::rt::bounds::{Http2ServerConnExec, Http2UpgradedExec};
+use crate::rt::bounds::{Http2PushExec, Http2ServerConnExec, Http2UpgradedExec};
 use crate::rt::{Read, Write};
 use crate::service::HttpService;
 
@@ -408,6 +408,8 @@ pin_project! {
         state: H2StreamState<F, B>,
         date_header: bool,
         informational: Option<InformationalReceiver>,
+        // The pushes to promise on the stream (see `Http2Pushes`).
+        pushes: Option<Http2PushStream<B>>,
         exec: E,
     }
 }
@@ -426,6 +428,10 @@ pin_project! {
         Body {
             #[pin]
             pipe: PipeToSendStream<B>,
+        },
+        // A bodiless response, sent once no more pushes can be promised on its stream.
+        Bodiless {
+            res: Option<::http::Response<()>>,
         },
     }
 }
@@ -453,6 +459,7 @@ where
             state: H2StreamState::Service { fut, connect_parts },
             date_header,
             informational,
+            pushes: None,
             exec,
         }
     }
@@ -500,6 +507,60 @@ fn send_informational<B: Buf>(
     }
 }
 
+/// A response's head to send, as the client is to see it, and its body.
+fn response_head<B>(res: Response<B>, date_header: bool) -> (::http::Response<()>, B) {
+    let (head, body) = res.into_parts();
+    let mut res = ::http::Response::from_parts(head, ());
+    #[cfg(feature = "http1")]
+    apply_header_order(&mut res);
+    super::strip_connection_headers(res.headers_mut(), super::MessageKind::Response);
+
+    // set Date header if it isn't already set if instructed
+    if date_header {
+        res.headers_mut()
+            .entry(::http::header::DATE)
+            .or_insert_with(date::update_and_header_value);
+    }
+    (res, body)
+}
+
+/// Promises the pushes queued so far on `reply`'s stream, each response sent by a task of its
+/// own, and tells whether more may come. A push the client can't take is dropped.
+fn relay_pushes<B, E>(
+    reply: &mut SendResponse<SendBuf<B::Data>>,
+    pushes: &mut Option<Http2PushStream<B>>,
+    exec: &E,
+    date_header: bool,
+    cx: &mut Context<'_>,
+) -> bool
+where
+    B: Body,
+    E: Http2PushExec<B>,
+{
+    let Some(stream) = pushes else {
+        return false;
+    };
+    loop {
+        match stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(push)) => match reply.push_request(push.request) {
+                Ok(reply) => exec.execute_push(H2Push {
+                    reply,
+                    state: H2PushState::Response { fut: push.response },
+                    date_header,
+                }),
+                Err(_e) => {
+                    debug!("push promise error: {}", _e);
+                }
+            },
+            Poll::Ready(None) => {
+                *pushes = None;
+                return false;
+            }
+            Poll::Pending => return true,
+        }
+    }
+}
+
 macro_rules! reply {
     ($me:expr, $res:expr, $eos:expr) => {{
         match $me.reply.send_response($res, $eos) {
@@ -516,10 +577,10 @@ macro_rules! reply {
 impl<F, B, Ex, E> H2Stream<F, B, Ex>
 where
     F: Future<Output = Result<Response<B>, E>>,
-    B: Body,
+    B: Body + 'static,
     B::Data: 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    Ex: Http2UpgradedExec<B::Data>,
+    Ex: Http2UpgradedExec<B::Data> + Http2PushExec<B>,
     E: Into<Box<dyn StdError + Send + Sync>>,
 {
     fn poll2(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
@@ -530,7 +591,7 @@ where
                     fut: h,
                     connect_parts,
                 } => {
-                    let res = match h.poll(cx) {
+                    let mut res = match h.poll(cx) {
                         Poll::Ready(Ok(r)) => r,
                         Poll::Pending => {
                             send_informational(me.reply, me.informational, cx);
@@ -556,21 +617,11 @@ where
                     send_informational(me.reply, me.informational, cx);
                     *me.informational = None;
 
-                    let (head, body) = res.into_parts();
-                    let mut res = ::http::Response::from_parts(head, ());
-                    #[cfg(feature = "http1")]
-                    apply_header_order(&mut res);
-                    super::strip_connection_headers(
-                        res.headers_mut(),
-                        super::MessageKind::Response,
-                    );
-
-                    // set Date header if it isn't already set if instructed
-                    if *me.date_header {
-                        res.headers_mut()
-                            .entry(::http::header::DATE)
-                            .or_insert_with(date::update_and_header_value);
-                    }
+                    *me.pushes = res
+                        .extensions_mut()
+                        .remove::<Http2Pushes<B>>()
+                        .and_then(|pushes| pushes.take());
+                    let (mut res, body) = response_head(res, *me.date_header);
 
                     if let Some(connect_parts) = connect_parts.take() {
                         if res.status().is_success() {
@@ -602,6 +653,8 @@ where
                         }
                     }
 
+                    // The pushes queued so far are promised ahead of the response.
+                    relay_pushes(me.reply, me.pushes, me.exec, *me.date_header, cx);
                     if !body.is_end_stream() {
                         // automatically set Content-Length from body...
                         if let Some(len) = body.size_hint().exact() {
@@ -613,13 +666,30 @@ where
                         H2StreamState::Body {
                             pipe: PipeToSendStream::new(body, body_tx, raw_trailers),
                         }
+                    } else if me.pushes.is_some() {
+                        H2StreamState::Bodiless { res: Some(res) }
                     } else {
                         reply!(me, res, true);
                         return Poll::Ready(Ok(()));
                     }
                 }
-                H2StreamStateProj::Body { pipe } => {
+                H2StreamStateProj::Body { mut pipe } => {
+                    let pushing = relay_pushes(me.reply, me.pushes, me.exec, *me.date_header, cx);
+                    pipe.as_mut().hold_end(pushing);
                     return pipe.poll(cx);
+                }
+                H2StreamStateProj::Bodiless { res } => {
+                    if relay_pushes(me.reply, me.pushes, me.exec, *me.date_header, cx) {
+                        if let Poll::Ready(reason) =
+                            me.reply.poll_reset(cx).map_err(crate::Error::new_h2)?
+                        {
+                            debug!("stream received RST_STREAM: {:?}", reason);
+                            return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
+                        }
+                        return Poll::Pending;
+                    }
+                    reply!(me, res.take().expect("polled after complete"), true);
+                    return Poll::Ready(Ok(()));
                 }
             };
             me.state.set(next);
@@ -630,10 +700,10 @@ where
 impl<F, B, Ex, E> Future for H2Stream<F, B, Ex>
 where
     F: Future<Output = Result<Response<B>, E>>,
-    B: Body,
+    B: Body + 'static,
     B::Data: 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    Ex: Http2UpgradedExec<B::Data>,
+    Ex: Http2UpgradedExec<B::Data> + Http2PushExec<B>,
     E: Into<Box<dyn StdError + Send + Sync>>,
 {
     type Output = ();
@@ -644,5 +714,97 @@ where
                 debug!("stream error: {}", _e);
             }
         })
+    }
+}
+
+pin_project! {
+    /// Sends a pushed response on its promised stream.
+    #[allow(missing_debug_implementations)]
+    pub struct H2Push<B>
+    where
+        B: Body,
+    {
+        reply: SendPushedResponse<SendBuf<B::Data>>,
+        #[pin]
+        state: H2PushState<B>,
+        date_header: bool,
+    }
+}
+
+pin_project! {
+    #[project = H2PushStateProj]
+    enum H2PushState<B>
+    where
+        B: Body,
+    {
+        Response {
+            fut: Pin<Box<dyn Future<Output = Result<Response<B>, Box<dyn StdError + Send + Sync>>> + Send>>,
+        },
+        Body {
+            #[pin]
+            pipe: PipeToSendStream<B>,
+        },
+    }
+}
+
+impl<B> Future for H2Push<B>
+where
+    B: Body,
+    B::Data: 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut me = self.project();
+        loop {
+            let next = match me.state.as_mut().project() {
+                H2PushStateProj::Response { fut } => {
+                    let res = match fut.as_mut().poll(cx) {
+                        Poll::Ready(Ok(res)) => res,
+                        Poll::Pending => {
+                            if let Poll::Ready(_reason) = me.reply.poll_reset(cx) {
+                                debug!("pushed stream received RST_STREAM: {:?}", _reason);
+                                return Poll::Ready(());
+                            }
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            let err = crate::Error::new_user_service(e);
+                            debug!("pushed response errored: {}", err);
+                            me.reply.send_reset(err.h2_reason());
+                            return Poll::Ready(());
+                        }
+                    };
+                    let (mut res, body) = response_head(res, *me.date_header);
+                    let eos = body.is_end_stream();
+                    if !eos {
+                        if let Some(len) = body.size_hint().exact() {
+                            headers::set_content_length_if_missing(res.headers_mut(), len);
+                        }
+                    }
+                    let raw_trailers = res.extensions().get::<RawTrailers>().cloned();
+                    match me.reply.send_response(res, eos) {
+                        Ok(_) if eos => return Poll::Ready(()),
+                        Ok(body_tx) => H2PushState::Body {
+                            pipe: PipeToSendStream::new(body, body_tx, raw_trailers),
+                        },
+                        Err(_e) => {
+                            debug!("send pushed response error: {}", _e);
+                            me.reply.send_reset(Reason::INTERNAL_ERROR);
+                            return Poll::Ready(());
+                        }
+                    }
+                }
+                H2PushStateProj::Body { pipe } => {
+                    return pipe.poll(cx).map(|res| {
+                        if let Err(_e) = res {
+                            debug!("pushed stream error: {}", _e);
+                        }
+                    });
+                }
+            };
+            me.state.set(next);
+        }
     }
 }

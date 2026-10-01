@@ -119,6 +119,9 @@ pin_project! {
         buffered_data: Option<Peeked<S::Data>>,
         // The trailer field order to send the body's trailers in, once recorded.
         raw_trailers: Option<RawTrailers>,
+        // Whether the stream's end waits (see `hold_end`), and how it ends once it doesn't.
+        hold_end: bool,
+        held_end: Option<End>,
         #[pin]
         stream: S,
     }
@@ -127,6 +130,13 @@ pin_project! {
 struct Peeked<D> {
     data: D,
     is_eos: bool,
+}
+
+/// How a body's stream ends, after its last DATA frame: with trailers, or an empty
+/// `END_STREAM` DATA frame.
+enum End {
+    Trailers(HeaderMap),
+    Eos,
 }
 
 impl<S> PipeToSendStream<S>
@@ -143,8 +153,17 @@ where
             data_done: false,
             buffered_data: None,
             raw_trailers,
+            hold_end: false,
+            held_end: None,
             stream,
         }
+    }
+
+    /// Holds the stream's end (its last DATA frame, trailers, or `END_STREAM`) back while
+    /// `hold`.
+    #[cfg(feature = "server")]
+    fn hold_end(self: Pin<&mut Self>, hold: bool) {
+        *self.project().hold_end = hold;
     }
 
     #[cfg(feature = "client")]
@@ -179,6 +198,9 @@ where
             // send capacity, drive that to completion before touching the
             // body again.
             if me.buffered_data.is_some() {
+                if *me.hold_end && matches!(me.buffered_data, Some(peeked) if peeked.is_eos) {
+                    return Poll::Pending;
+                }
                 while me.body_tx.capacity() == 0 {
                     match ready!(me.body_tx.poll_capacity(cx)) {
                         Some(Ok(0)) => {}
@@ -207,6 +229,20 @@ where
                 continue;
             }
 
+            if let Some(end) = me.held_end.take() {
+                if *me.hold_end {
+                    *me.held_end = Some(end);
+                    return Poll::Pending;
+                }
+                return Poll::Ready(match end {
+                    End::Trailers(trailers) => me
+                        .body_tx
+                        .send_trailers_with_order(trailers, trailer_order(me.raw_trailers.as_ref()))
+                        .map_err(crate::Error::new_body_write),
+                    End::Eos => me.body_tx.send_eos_frame(),
+                });
+            }
+
             // Poll for the next body frame *before* reserving any connection
             // flow-control capacity. Reserving capacity speculatively (even a
             // single byte) pins that capacity on the connection-level window,
@@ -222,6 +258,10 @@ where
                         trace!("send body chunk: {} bytes, eos={}", len, is_eos);
 
                         if len == 0 {
+                            if is_eos && *me.hold_end {
+                                *me.held_end = Some(End::Eos);
+                                continue;
+                            }
                             // Zero-length data frames need no capacity; send
                             // them straight through so trailing empty frames
                             // (e.g. an explicit end-of-stream marker) are
@@ -259,13 +299,9 @@ where
                     } else if frame.is_trailers() {
                         // no more DATA, so give any capacity back
                         me.body_tx.reserve_capacity(0);
-                        me.body_tx
-                            .send_trailers_with_order(
-                                frame.into_trailers().unwrap_or_else(|_| unreachable!()),
-                                trailer_order(me.raw_trailers.as_ref()),
-                            )
-                            .map_err(crate::Error::new_body_write)?;
-                        return Poll::Ready(Ok(()));
+                        *me.held_end = Some(End::Trailers(
+                            frame.into_trailers().unwrap_or_else(|_| unreachable!()),
+                        ));
                     } else {
                         trace!("discarding unknown frame");
                         // loop again
@@ -276,7 +312,7 @@ where
                     // no more frames means we're done here
                     // but at this point, we haven't sent an EOS DATA, or
                     // any trailers, so send an empty EOS DATA.
-                    return Poll::Ready(me.body_tx.send_eos_frame());
+                    *me.held_end = Some(End::Eos);
                 }
             }
         }

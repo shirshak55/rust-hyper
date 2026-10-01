@@ -6,6 +6,8 @@
 #[cfg(all(feature = "client", feature = "http2"))]
 pub use self::h2_client::Http2ClientConnExec;
 #[cfg(all(feature = "server", feature = "http2"))]
+pub(crate) use self::h2_server::Http2PushExec;
+#[cfg(all(feature = "server", feature = "http2"))]
 pub use self::h2_server::Http2ServerConnExec;
 
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
@@ -94,7 +96,10 @@ mod h2_client {
 #[cfg(all(feature = "server", feature = "http2"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "server", feature = "http2"))))]
 mod h2_server {
-    use crate::{proto::h2::server::H2Stream, rt::Executor};
+    use crate::{
+        proto::h2::server::{H2Push, H2Stream},
+        rt::Executor,
+    };
     use http_body::Body;
     use std::future::Future;
 
@@ -107,7 +112,7 @@ mod h2_server {
     ///
     /// [`Executor`]: crate::rt::Executor
     pub trait Http2ServerConnExec<F, B: Body>:
-        super::Http2UpgradedExec<B::Data> + sealed::Sealed<(F, B)> + Clone
+        super::Http2UpgradedExec<B::Data> + Http2PushExec<B> + sealed::Sealed<(F, B)> + Clone
     {
         #[doc(hidden)]
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, Self>);
@@ -119,6 +124,7 @@ mod h2_server {
         E: Clone,
         E: Executor<H2Stream<F, B, E>>,
         E: super::Http2UpgradedExec<B::Data>,
+        E: Http2PushExec<B>,
         H2Stream<F, B, E>: Future<Output = ()>,
         B: Body,
     {
@@ -132,9 +138,26 @@ mod h2_server {
         E: Clone,
         E: Executor<H2Stream<F, B, E>>,
         E: super::Http2UpgradedExec<B::Data>,
+        E: Http2PushExec<B>,
         H2Stream<F, B, E>: Future<Output = ()>,
         B: Body,
     {
+    }
+
+    pub trait Http2PushExec<B: Body> {
+        #[doc(hidden)]
+        fn execute_push(&self, fut: H2Push<B>);
+    }
+
+    #[doc(hidden)]
+    impl<E, B> Http2PushExec<B> for E
+    where
+        E: Executor<H2Push<B>>,
+        B: Body,
+    {
+        fn execute_push(&self, fut: H2Push<B>) {
+            self.execute(fut);
+        }
     }
 
     mod sealed {
