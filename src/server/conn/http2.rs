@@ -351,6 +351,15 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Ends the connection as `end` relays another connection's end: it sends the `GOAWAY`s
+    /// `end` relays, then closes once it has no streams when `end` says so, with no `GOAWAY`
+    /// of its own (see [`RelayedEnd`](crate::ext::http2::RelayedEnd)). Lets an intermediary
+    /// end a client's connection as the server it relays to ended its own.
+    pub fn relayed_end(&mut self, end: crate::ext::http2::RelayedEnd) -> &mut Self {
+        self.h2_builder.relayed_end = Some(end);
+        self
+    }
+
     /// Bind a connection together with a [`Service`](crate::service::Service).
     ///
     /// This returns a Future that must be polled in order for HTTP to be

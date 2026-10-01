@@ -149,7 +149,7 @@ impl fmt::Debug for Protocol {
 pub mod http2 {
     pub use h2::ext::{
         deferred_preface, DeferredPreface, FrameLog, HeadersFrame, LoggedFrame, PrefaceFrame,
-        PrefaceSender, PseudoHeader, StreamPriority,
+        PrefaceSender, PseudoHeader, RelayedEnd, StreamPriority,
     };
 }
 

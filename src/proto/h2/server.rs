@@ -65,6 +65,7 @@ pub(crate) struct Config {
     pub(crate) record_frames: Option<usize>,
     pub(crate) deferred_preface: Option<h2::ext::DeferredPreface>,
     pub(crate) leave_close_to_client: bool,
+    pub(crate) relayed_end: Option<h2::ext::RelayedEnd>,
 }
 
 impl Default for Config {
@@ -88,6 +89,7 @@ impl Default for Config {
             record_frames: None,
             deferred_preface: None,
             leave_close_to_client: false,
+            relayed_end: None,
         }
     }
 }
@@ -175,6 +177,9 @@ where
         }
         if config.leave_close_to_client {
             builder.leave_close_to_client();
+        }
+        if let Some(end) = config.relayed_end.clone() {
+            builder.relayed_end(end);
         }
         let handshake = builder.handshake(Compat::new(io));
 
