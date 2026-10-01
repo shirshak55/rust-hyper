@@ -1,9 +1,12 @@
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
+use atomic_waker::AtomicWaker;
 use bytes::{Buf, Bytes};
 use futures_core::ready;
 use h2::server::{Connection, Handshake, SendPushedResponse, SendResponse};
@@ -410,6 +413,7 @@ pin_project! {
         informational: Option<InformationalReceiver>,
         // The pushes to promise on the stream (see `Http2Pushes`).
         pushes: Option<Http2PushStream<B>>,
+        turns: Vec<Arc<PushTurn>>,
         exec: E,
     }
 }
@@ -460,6 +464,7 @@ where
             date_header,
             informational,
             pushes: None,
+            turns: Vec::new(),
             exec,
         }
     }
@@ -525,10 +530,13 @@ fn response_head<B>(res: Response<B>, date_header: bool) -> (::http::Response<()
 }
 
 /// Promises the pushes queued so far on `reply`'s stream, each response sent by a task of its
-/// own, and tells whether more may come. A push the client can't take is dropped.
+/// own (its turn kept in `turns`), and tells whether the stream's end waits: more may come,
+/// or a promised one's task has yet to send what it has ready. A push the client can't take
+/// is dropped.
 fn relay_pushes<B, E>(
     reply: &mut SendResponse<SendBuf<B::Data>>,
     pushes: &mut Option<Http2PushStream<B>>,
+    turns: &mut Vec<Arc<PushTurn>>,
     exec: &E,
     date_header: bool,
     cx: &mut Context<'_>,
@@ -537,27 +545,88 @@ where
     B: Body,
     E: Http2PushExec<B>,
 {
-    let Some(stream) = pushes else {
-        return false;
-    };
-    loop {
-        match stream.as_mut().poll_next(cx) {
-            Poll::Ready(Some(push)) => match reply.push_request(push.request) {
-                Ok(reply) => exec.execute_push(H2Push {
-                    reply,
-                    state: H2PushState::Response { fut: push.response },
-                    date_header,
-                }),
-                Err(_e) => {
-                    debug!("push promise error: {}", _e);
+    let more = match pushes {
+        Some(stream) => loop {
+            match stream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(push)) => match reply.push_request(push.request) {
+                    Ok(reply) => {
+                        let turn = PushTurn::new();
+                        turns.push(Arc::clone(&turn));
+                        exec.execute_push(H2Push {
+                            reply,
+                            state: H2PushState::Response { fut: push.response },
+                            date_header,
+                            relayed: false,
+                            turn: PushTurnHeld(turn),
+                        });
+                    }
+                    Err(_e) => {
+                        debug!("push promise error: {}", _e);
+                    }
+                },
+                Poll::Ready(None) => {
+                    *pushes = None;
+                    break false;
                 }
-            },
-            Poll::Ready(None) => {
-                *pushes = None;
-                return false;
+                Poll::Pending => break true,
             }
-            Poll::Pending => return true,
-        }
+        },
+        None => false,
+    };
+    turns.retain(|turn| !turn.done.load(Ordering::Acquire));
+    for turn in turns.iter() {
+        turn.stream.register(cx.waker());
+    }
+    more || turns.iter().any(|turn| turn.busy())
+}
+
+/// A pushed response's progress, as the end of the stream it was promised on waits for it:
+/// until its task is done, or was polled since it was last woken and what it sent went out,
+/// what it has ready goes out ahead of that end, as the origin sent it ahead.
+struct PushTurn {
+    woken: AtomicUsize,
+    polled: AtomicUsize,
+    done: AtomicBool,
+    task: AtomicWaker,
+    stream: AtomicWaker,
+}
+
+impl PushTurn {
+    fn new() -> Arc<Self> {
+        Arc::new(PushTurn {
+            // Not yet polled, it has its response to send.
+            woken: AtomicUsize::new(1),
+            polled: AtomicUsize::new(0),
+            done: AtomicBool::new(false),
+            task: AtomicWaker::new(),
+            stream: AtomicWaker::new(),
+        })
+    }
+
+    fn busy(&self) -> bool {
+        !self.done.load(Ordering::Acquire)
+            && self.woken.load(Ordering::Acquire) != self.polled.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for PushTurn {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.fetch_add(1, Ordering::AcqRel);
+        self.task.wake();
+    }
+}
+
+/// A push task's [`PushTurn`], done once the task drops it.
+struct PushTurnHeld(Arc<PushTurn>);
+
+impl Drop for PushTurnHeld {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+        self.0.stream.wake();
     }
 }
 
@@ -654,7 +723,7 @@ where
                     }
 
                     // The pushes queued so far are promised ahead of the response.
-                    relay_pushes(me.reply, me.pushes, me.exec, *me.date_header, cx);
+                    relay_pushes(me.reply, me.pushes, me.turns, me.exec, *me.date_header, cx);
                     if !body.is_end_stream() {
                         // automatically set Content-Length from body...
                         if let Some(len) = body.size_hint().exact() {
@@ -674,12 +743,13 @@ where
                     }
                 }
                 H2StreamStateProj::Body { mut pipe } => {
-                    let pushing = relay_pushes(me.reply, me.pushes, me.exec, *me.date_header, cx);
+                    let pushing =
+                        relay_pushes(me.reply, me.pushes, me.turns, me.exec, *me.date_header, cx);
                     pipe.as_mut().hold_end(pushing);
                     return pipe.poll(cx);
                 }
                 H2StreamStateProj::Bodiless { res } => {
-                    if relay_pushes(me.reply, me.pushes, me.exec, *me.date_header, cx) {
+                    if relay_pushes(me.reply, me.pushes, me.turns, me.exec, *me.date_header, cx) {
                         if let Poll::Ready(reason) =
                             me.reply.poll_reset(cx).map_err(crate::Error::new_h2)?
                         {
@@ -728,6 +798,8 @@ pin_project! {
         #[pin]
         state: H2PushState<B>,
         date_header: bool,
+        relayed: bool,
+        turn: PushTurnHeld,
     }
 }
 
@@ -755,7 +827,38 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let turn = Arc::clone(&self.turn.0);
+        turn.task.register(cx.waker());
+        let woken = turn.woken.load(Ordering::Acquire);
+        let waker = Waker::from(Arc::clone(&turn));
+        let cx = &mut Context::from_waker(&waker);
+        if !self.relayed {
+            let relayed = self.as_mut().relay(cx).is_ready();
+            *self.as_mut().project().relayed = relayed;
+        }
+        let me = self.project();
+        // What it sent goes out ahead of what the stream it was promised on sends next.
+        if me.reply.poll_flushed(cx).is_pending() {
+            return Poll::Pending;
+        }
+        turn.polled.store(woken, Ordering::Release);
+        turn.stream.wake();
+        if *me.relayed {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<B> H2Push<B>
+where
+    B: Body,
+    B::Data: 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    fn relay(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut me = self.project();
         loop {
             let next = match me.state.as_mut().project() {
