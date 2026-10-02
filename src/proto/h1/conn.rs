@@ -65,6 +65,8 @@ where
                 #[cfg(feature = "server")]
                 h1_header_read_timeout_running: false,
                 #[cfg(feature = "server")]
+                h1_header_read_timeout_on_first_byte: false,
+                #[cfg(feature = "server")]
                 date_header: true,
                 #[cfg(feature = "server")]
                 timer: Time::Empty,
@@ -179,6 +181,11 @@ where
     }
 
     #[cfg(feature = "server")]
+    pub(crate) fn set_http1_header_read_timeout_on_first_byte(&mut self, val: bool) {
+        self.state.h1_header_read_timeout_on_first_byte = val;
+    }
+
+    #[cfg(feature = "server")]
     pub(crate) fn set_allow_half_close(&mut self) {
         self.state.allow_half_close = true;
     }
@@ -240,6 +247,31 @@ where
         read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
     }
 
+    #[cfg(feature = "server")]
+    fn arm_h1_header_read_timeout(&mut self) {
+        if self.state.h1_header_read_timeout_running
+            || (self.state.h1_header_read_timeout_on_first_byte && self.io.read_buf().is_empty())
+        {
+            return;
+        }
+        let Some(h1_header_read_timeout) = self.state.h1_header_read_timeout else {
+            return;
+        };
+        let deadline = self.state.timer.now() + h1_header_read_timeout;
+        self.state.h1_header_read_timeout_running = true;
+        match &mut self.state.h1_header_read_timeout_fut {
+            Some(h1_header_read_timeout_fut) => {
+                trace!("resetting h1 header read timeout timer");
+                self.state.timer.reset(h1_header_read_timeout_fut, deadline);
+            }
+            None => {
+                trace!("setting h1 header read timeout timer");
+                self.state.h1_header_read_timeout_fut =
+                    Some(self.state.timer.sleep_until(deadline));
+            }
+        }
+    }
+
     pub(super) fn poll_read_head(
         &mut self,
         cx: &mut Context<'_>,
@@ -248,23 +280,7 @@ where
         trace!("Conn::read_head");
 
         #[cfg(feature = "server")]
-        if !self.state.h1_header_read_timeout_running {
-            if let Some(h1_header_read_timeout) = self.state.h1_header_read_timeout {
-                let deadline = self.state.timer.now() + h1_header_read_timeout;
-                self.state.h1_header_read_timeout_running = true;
-                match &mut self.state.h1_header_read_timeout_fut {
-                    Some(h1_header_read_timeout_fut) => {
-                        trace!("resetting h1 header read timeout timer");
-                        self.state.timer.reset(h1_header_read_timeout_fut, deadline);
-                    }
-                    None => {
-                        trace!("setting h1 header read timeout timer");
-                        self.state.h1_header_read_timeout_fut =
-                            Some(self.state.timer.sleep_until(deadline));
-                    }
-                }
-            }
-        }
+        self.arm_h1_header_read_timeout();
 
         let mut msg = match self.io.parse::<T>(
             cx,
@@ -285,6 +301,8 @@ where
             Poll::Ready(Ok(msg)) => msg,
             Poll::Ready(Err(e)) => return self.on_read_head_error(e),
             Poll::Pending => {
+                #[cfg(feature = "server")]
+                self.arm_h1_header_read_timeout();
                 #[cfg(feature = "server")]
                 if self.state.h1_header_read_timeout_running {
                     if let Some(h1_header_read_timeout_fut) =
@@ -1096,6 +1114,8 @@ struct State {
     h1_header_read_timeout_fut: Option<Pin<Box<dyn Sleep>>>,
     #[cfg(feature = "server")]
     h1_header_read_timeout_running: bool,
+    #[cfg(feature = "server")]
+    h1_header_read_timeout_on_first_byte: bool,
     #[cfg(feature = "server")]
     date_header: bool,
     #[cfg(feature = "server")]

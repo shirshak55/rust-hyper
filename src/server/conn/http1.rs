@@ -83,6 +83,7 @@ pub struct Builder {
     h1_preserve_response_version: bool,
     h1_max_headers: Option<usize>,
     h1_header_read_timeout: Dur,
+    h1_header_read_timeout_on_first_byte: bool,
     h1_writev: Option<bool>,
     max_buf_size: Option<usize>,
     pipeline_flush: bool,
@@ -258,6 +259,7 @@ impl Builder {
             h1_preserve_response_version: false,
             h1_max_headers: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
+            h1_header_read_timeout_on_first_byte: false,
             h1_writev: None,
             max_buf_size: None,
             pipeline_flush: false,
@@ -428,6 +430,17 @@ impl Builder {
         self
     }
 
+    /// Start the [`header_read_timeout`](Self::header_read_timeout) on the
+    /// first byte of a request head instead of as soon as the connection is
+    /// ready to read one, so a kept-alive connection idling between requests
+    /// is not closed by it.
+    ///
+    /// Default is false.
+    pub fn header_read_timeout_on_first_byte(&mut self, val: bool) -> &mut Self {
+        self.h1_header_read_timeout_on_first_byte = val;
+        self
+    }
+
     /// Set whether HTTP/1 connections should try to use vectored writes,
     /// or always flatten into a single buffer.
     ///
@@ -566,6 +579,9 @@ impl Builder {
             .check(self.h1_header_read_timeout, "header_read_timeout")
         {
             conn.set_http1_header_read_timeout(dur);
+            conn.set_http1_header_read_timeout_on_first_byte(
+                self.h1_header_read_timeout_on_first_byte,
+            );
         }
         if let Some(writev) = self.h1_writev {
             if writev {
