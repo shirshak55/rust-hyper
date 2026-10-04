@@ -306,8 +306,13 @@ impl Http1Transaction for Server {
                     if is_te {
                         continue;
                     }
-                    let len = headers::content_length_parse(&value)
-                        .ok_or_else(Parse::content_length_invalid)?;
+                    // A request keeping its fields as sent keeps a listed length as it is.
+                    let len = if header_case_map.is_some() {
+                        headers::content_length_parse_list(&value)
+                    } else {
+                        headers::content_length_parse(&value)
+                    }
+                    .ok_or_else(Parse::content_length_invalid)?;
                     if let Some(prev) = con_len {
                         if prev != len {
                             debug!(

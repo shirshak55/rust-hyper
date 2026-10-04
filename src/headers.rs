@@ -55,6 +55,19 @@ pub(super) fn content_length_parse(value: &HeaderValue) -> Option<u64> {
     from_digits(value.as_bytes())
 }
 
+/// A Content-Length value of one length, maybe listed more than once (`5, 5`), which
+/// RFC 9110 §8.6 lets a recipient read as that length.
+#[cfg(all(feature = "http1", feature = "server"))]
+pub(super) fn content_length_parse_list(value: &HeaderValue) -> Option<u64> {
+    let mut lengths = value
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(|length| from_digits(length.trim().as_bytes()));
+    let first = lengths.next()??;
+    lengths.all(|length| length == Some(first)).then_some(first)
+}
+
 #[cfg(any(feature = "client", all(feature = "server", feature = "http2")))]
 pub(super) fn content_length_parse_all(headers: &HeaderMap) -> Option<u64> {
     content_length_parse_all_values(headers.get_all(CONTENT_LENGTH).into_iter())
