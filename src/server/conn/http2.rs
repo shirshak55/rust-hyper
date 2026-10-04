@@ -362,6 +362,19 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Serves on a request whose client resets its stream before the response is ready,
+    /// rather than dropping the service's future, the response going nowhere. Lets an
+    /// intermediary relay the request and its reset as the client sent them. At most as
+    /// many such requests run at once as
+    /// [`max_concurrent_streams`](Self::max_concurrent_streams) allows (any number without
+    /// it); those past it are dropped.
+    ///
+    /// By default the service's future is dropped.
+    pub fn serve_reset_requests(&mut self) -> &mut Self {
+        self.h2_builder.serve_reset_requests = true;
+        self
+    }
+
     /// Ends the connection as `end` relays another connection's end: it sends the `GOAWAY`s
     /// `end` relays, then closes once it has no streams when `end` says so, with no `GOAWAY`
     /// of its own (see [`RelayedEnd`](crate::ext::http2::RelayedEnd)). Lets an intermediary

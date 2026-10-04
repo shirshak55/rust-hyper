@@ -67,6 +67,7 @@ pub(crate) struct Config {
     pub(crate) deferred_preface: Option<h2::ext::DeferredPreface>,
     pub(crate) leave_close_to_client: bool,
     pub(crate) relayed_end: Option<h2::ext::RelayedEnd>,
+    pub(crate) serve_reset_requests: bool,
 }
 
 impl Default for Config {
@@ -92,6 +93,7 @@ impl Default for Config {
             deferred_preface: None,
             leave_close_to_client: false,
             relayed_end: None,
+            serve_reset_requests: false,
         }
     }
 }
@@ -109,7 +111,8 @@ pin_project! {
         date_header: bool,
         informational: bool,
         extended_connect_as_request: bool,
-        close_pending: bool
+        close_pending: bool,
+        reset_requests: Option<ResetRequests>,
     }
 }
 
@@ -136,6 +139,32 @@ where
     date_header: bool,
     informational: bool,
     extended_connect_as_request: bool,
+    reset_requests: Option<ResetRequests>,
+}
+
+/// The requests a connection serves on after their clients reset their streams (see
+/// `Config::serve_reset_requests`): how many run, `max` at most.
+#[derive(Clone)]
+struct ResetRequests {
+    running: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl ResetRequests {
+    /// A place for one more, unless `max` run.
+    fn take(&self) -> Option<ResetRequest> {
+        let request = ResetRequest(Arc::clone(&self.running));
+        (self.running.fetch_add(1, Ordering::AcqRel) < self.max).then_some(request)
+    }
+}
+
+/// A request served on after its client reset its stream, until dropped.
+struct ResetRequest(Arc<AtomicUsize>);
+
+impl Drop for ResetRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -214,6 +243,12 @@ where
             informational: config.informational,
             extended_connect_as_request: config.extended_connect_as_request,
             close_pending: false,
+            reset_requests: config.serve_reset_requests.then(|| ResetRequests {
+                running: Arc::new(AtomicUsize::new(0)),
+                max: config
+                    .max_concurrent_streams
+                    .map_or(usize::MAX, |max| max as usize),
+            }),
         }
     }
 
@@ -261,6 +296,7 @@ where
                         date_header: me.date_header,
                         informational: me.informational,
                         extended_connect_as_request: me.extended_connect_as_request,
+                        reset_requests: me.reset_requests.clone(),
                     })
                 }
                 State::Serving(srv) => {
@@ -371,6 +407,7 @@ where
                             self.date_header,
                             informational,
                             exec.clone(),
+                            self.reset_requests.clone(),
                         );
 
                         exec.execute_h2stream(fut);
@@ -433,6 +470,9 @@ pin_project! {
         pushes: Option<Http2PushStream<B>>,
         turns: Vec<Arc<PushTurn>>,
         exec: E,
+        reset_requests: Option<ResetRequests>,
+        // Its client's reset, while the service runs on.
+        reset: Option<(ResetRequest, Reason)>,
     }
 }
 
@@ -475,6 +515,7 @@ where
         date_header: bool,
         informational: Option<InformationalReceiver>,
         exec: E,
+        reset_requests: Option<ResetRequests>,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
@@ -484,6 +525,8 @@ where
             pushes: None,
             turns: Vec::new(),
             exec,
+            reset_requests,
+            reset: None,
         }
     }
 }
@@ -679,8 +722,16 @@ where
                     connect_parts,
                 } => {
                     let mut res = match h.poll(cx) {
+                        // The client reset the stream: the response goes nowhere.
+                        Poll::Ready(_) if me.reset.is_some() => {
+                            let (_, reason) = me.reset.take().expect("the stream was reset");
+                            return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
+                        }
                         Poll::Ready(Ok(r)) => r,
                         Poll::Pending => {
+                            if me.reset.is_some() {
+                                return Poll::Pending;
+                            }
                             send_informational(me.reply, me.informational, cx);
                             // Response is not yet ready, so we want to check if the client has sent a
                             // RST_STREAM frame which would cancel the current request.
@@ -688,7 +739,14 @@ where
                                 me.reply.poll_reset(cx).map_err(crate::Error::new_h2)?
                             {
                                 debug!("stream received RST_STREAM: {:?}", reason);
-                                return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
+                                match me.reset_requests.as_ref().and_then(ResetRequests::take) {
+                                    Some(request) => *me.reset = Some((request, reason)),
+                                    None => {
+                                        return Poll::Ready(Err(crate::Error::new_h2(
+                                            reason.into(),
+                                        )))
+                                    }
+                                }
                             }
                             return Poll::Pending;
                         }
