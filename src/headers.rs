@@ -30,6 +30,17 @@ pub(super) fn connection_any_close(headers: &http::HeaderMap) -> bool {
         .any(connection_close)
 }
 
+// Returns true if the message asks to switch protocols: an `Upgrade` field, or a
+// `Connection` field listing `upgrade`.
+#[cfg(feature = "http1")]
+pub(super) fn upgrading(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(http::header::UPGRADE)
+        || headers
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .any(|value| header_value_has_token(value, "upgrade"))
+}
+
 #[cfg(feature = "http1")]
 fn header_value_has_token(value: &HeaderValue, needle: &str) -> bool {
     if let Ok(s) = value.to_str() {

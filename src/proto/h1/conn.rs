@@ -823,9 +823,14 @@ where
     // to work with our older peer.
     fn enforce_version(&mut self, head: &mut MessageHead<T::Outgoing>) {
         match self.state.version {
-            Version::HTTP_10 if self.state.preserve_response_version => {
-                // The response keeps its version; the connection persists only when the
-                // response asks for it, as HTTP/1.0 has it.
+            Version::HTTP_10 | Version::HTTP_11
+                if self.state.preserve_response_version
+                    && (self.state.version == Version::HTTP_10
+                        || head.version == Version::HTTP_10) =>
+            {
+                // The response keeps its version; an HTTP/1.0 client's connection, or one
+                // an HTTP/1.0 response goes over, persists only when the response asks for
+                // it, as HTTP/1.0 has it.
                 if !head
                     .headers
                     .get_all(CONNECTION)
@@ -843,9 +848,12 @@ where
                 head.version = Version::HTTP_10;
             }
             Version::HTTP_11 => {
-                // A message already saying `close` keeps its `Connection` as written.
+                // A message already saying `close`, or switching protocols, keeps its
+                // `Connection` as written.
                 if let KA::Disabled = self.state.keep_alive.status() {
-                    if !headers::connection_any_close(&head.headers) {
+                    if !headers::connection_any_close(&head.headers)
+                        && !headers::upgrading(&head.headers)
+                    {
                         head.headers
                             .insert(CONNECTION, HeaderValue::from_static("close"));
                     }
