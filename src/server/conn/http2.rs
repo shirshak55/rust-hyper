@@ -340,6 +340,17 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Serves an extended CONNECT (one with a `:protocol`) as an ordinary request: the
+    /// service reads the client's DATA from the request body, and the response body,
+    /// whatever its status, becomes the DATA sent back, its error resetting the stream. Lets
+    /// an intermediary relay the tunnel stream by stream rather than as an upgrade.
+    ///
+    /// By default an extended CONNECT is an upgrade, as any CONNECT is.
+    pub fn extended_connect_as_request(&mut self) -> &mut Self {
+        self.h2_builder.extended_connect_as_request = true;
+        self
+    }
+
     /// Leaves closing the connection to the client once it sent a `GOAWAY`: the connection
     /// stays open, sending no `GOAWAY` of its own, after the client's streams are done,
     /// until the client closes it. Lets an intermediary relaying the client's `GOAWAY` leave

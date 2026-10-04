@@ -62,6 +62,7 @@ pub(crate) struct Config {
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
     pub(crate) informational: bool,
+    pub(crate) extended_connect_as_request: bool,
     pub(crate) record_frames: Option<usize>,
     pub(crate) deferred_preface: Option<h2::ext::DeferredPreface>,
     pub(crate) leave_close_to_client: bool,
@@ -86,6 +87,7 @@ impl Default for Config {
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
             informational: false,
+            extended_connect_as_request: false,
             record_frames: None,
             deferred_preface: None,
             leave_close_to_client: false,
@@ -106,6 +108,7 @@ pin_project! {
         state: State<T, B>,
         date_header: bool,
         informational: bool,
+        extended_connect_as_request: bool,
         close_pending: bool
     }
 }
@@ -132,6 +135,7 @@ where
     closing: Option<crate::Error>,
     date_header: bool,
     informational: bool,
+    extended_connect_as_request: bool,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -208,6 +212,7 @@ where
             service,
             date_header: config.date_header,
             informational: config.informational,
+            extended_connect_as_request: config.extended_connect_as_request,
             close_pending: false,
         }
     }
@@ -255,6 +260,7 @@ where
                         closing: None,
                         date_header: me.date_header,
                         informational: me.informational,
+                        extended_connect_as_request: me.extended_connect_as_request,
                     })
                 }
                 State::Serving(srv) => {
@@ -304,7 +310,9 @@ where
                         // Record the headers received
                         ping.record_non_data();
 
-                        let is_connect = req.method() == Method::CONNECT;
+                        let is_connect = req.method() == Method::CONNECT
+                            && !(self.extended_connect_as_request
+                                && req.extensions().get::<h2::ext::Protocol>().is_some());
                         let (mut parts, stream) = req.into_parts();
                         let (mut req, connect_parts) = if !is_connect {
                             // Trailers may follow a body; record their field order.
