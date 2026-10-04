@@ -498,8 +498,8 @@ impl ReadClosed {
         }
     }
 
-    #[cfg(feature = "client")]
-    pub(crate) fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+    /// Ready once the client ended its sending side; otherwise wakes `cx` when it does.
+    pub fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let closed = || self.0.closed.load(std::sync::atomic::Ordering::Acquire);
         if !closed() {
             *self
