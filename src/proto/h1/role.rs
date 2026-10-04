@@ -215,6 +215,7 @@ impl Http1Transaction for Server {
         };
 
         let slice = buf.split_to(len).freeze();
+        let mut raw_target = None;
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
             if uri_bytes.is_ascii() {
@@ -224,8 +225,19 @@ impl Http1Transaction for Server {
                 // A request-target carrying raw non-ASCII bytes (`/caf\xc3\xa9`) is
                 // malformed, but hand-rolled clients send it and origins accept
                 // it. `Uri` can't hold those bytes, so percent-encode them
-                // instead of answering 400.
-                http::Uri::from_maybe_shared(percent_encode_non_ascii(&uri_bytes))?
+                // instead of answering 400, keeping them for a client relaying it.
+                let encoded = percent_encode_non_ascii(&uri_bytes);
+                let uri = http::Uri::from_maybe_shared(encoded.clone())?;
+                raw_target = uri.path_and_query().and_then(|encoded_pq| {
+                    let start = encoded.len().checked_sub(encoded_pq.as_str().len())?;
+                    (encoded.ends_with(encoded_pq.as_str().as_bytes())
+                        && uri_bytes.get(..start) == Some(&encoded[..start]))
+                    .then(|| crate::ext::RawRequestTarget {
+                        raw: uri_bytes.slice(start..),
+                        encoded: encoded_pq.clone(),
+                    })
+                });
+                uri
             }
         };
         subject = RequestLine(method, uri);
@@ -304,11 +316,15 @@ impl Http1Transaction for Server {
                             );
                             return Err(Parse::content_length_invalid());
                         }
-                        // we don't need to append this secondary length
-                        continue;
+                        // A request keeping its fields as sent keeps this repeat of the
+                        // length too.
+                        if header_case_map.is_none() {
+                            continue;
+                        }
+                    } else {
+                        decoder = DecodedLength::checked_new(len)?;
+                        con_len = Some(len);
                     }
-                    decoder = DecodedLength::checked_new(len)?;
-                    con_len = Some(len);
                 }
                 header::CONNECTION => {
                     // keep_alive was previously set to default for Version
@@ -335,7 +351,11 @@ impl Http1Transaction for Server {
             }
 
             if let Some(header_case_map) = &mut header_case_map {
-                header_case_map.append(&name, slice.slice(header.name.0..header.name.1));
+                header_case_map.append_spaced(
+                    &name,
+                    slice.slice(header.name.0..header.name.1),
+                    field_spacing(&slice, header),
+                );
             }
             if let Some(header_order) = &mut header_order {
                 header_order.append(&name);
@@ -360,6 +380,9 @@ impl Http1Transaction for Server {
         }
         if let Some(header_order) = header_order {
             extensions.insert(header_order);
+        }
+        if let Some(raw_target) = raw_target {
+            extensions.insert(raw_target);
         }
 
         *ctx.req_method = Some(subject.0.clone());
@@ -1272,8 +1295,28 @@ impl Http1Transaction for Client {
 
         extend(dst, msg.head.subject.0.as_str().as_bytes());
         extend(dst, b" ");
-        //TODO: add API to http::Uri to encode without std::fmt
-        let _ = write!(FastWrite(dst), "{} ", msg.head.subject.1);
+        let uri = &msg.head.subject.1;
+        match msg
+            .head
+            .extensions
+            .get::<crate::ext::RawRequestTarget>()
+            .filter(|raw| uri.path_and_query() == Some(&raw.encoded))
+        {
+            Some(raw) => {
+                if let Some(scheme) = uri.scheme() {
+                    let _ = write!(FastWrite(dst), "{scheme}://");
+                }
+                if let Some(authority) = uri.authority() {
+                    extend(dst, authority.as_str().as_bytes());
+                }
+                extend(dst, &raw.raw);
+                extend(dst, b" ");
+            }
+            //TODO: add API to http::Uri to encode without std::fmt
+            None => {
+                let _ = write!(FastWrite(dst), "{uri} ");
+            }
+        }
 
         match msg.head.version {
             Version::HTTP_10 => extend(dst, b"HTTP/1.0"),
@@ -1636,6 +1679,20 @@ fn record_header_indices(
     Ok(())
 }
 
+/// What a parsed field line has between its name and its value, and after its value up
+/// to its line ending.
+#[cfg(feature = "server")]
+fn field_spacing(slice: &Bytes, header: &HeaderIndices) -> crate::ext::FieldSpacing {
+    let line_end = slice[header.value.1..]
+        .iter()
+        .position(|&byte| byte == b'\r' || byte == b'\n')
+        .map_or(slice.len(), |at| header.value.1 + at);
+    crate::ext::FieldSpacing {
+        separator: slice.slice(header.name.1..header.value.0),
+        trailing: slice.slice(header.value.1..line_end),
+    }
+}
+
 // Write header names as title case. The header name is assumed to be ASCII.
 fn title_case(dst: &mut Vec<u8>, name: &[u8]) {
     dst.reserve(name.len());
@@ -1727,7 +1784,11 @@ pub(super) fn write_message_headers(
                 None if title_case_headers => title_case(dst, name.as_str().as_bytes()),
                 None => extend(dst, name.as_str().as_bytes()),
             }
-            write_header_value_line(dst, &value);
+            write_header_value_line(
+                dst,
+                &value,
+                orig_case.and_then(|map| map.spacing(&name, nth)),
+            );
         }
     } else if let Some(orig_case) = orig_case {
         write_headers_original_case(headers, orig_case, dst, title_case_headers);
@@ -1739,14 +1800,25 @@ pub(super) fn write_message_headers(
 }
 
 #[inline]
-fn write_header_value_line(dst: &mut Vec<u8>, value: &HeaderValue) {
-    // Wanted for curl test cases that send `X-Custom-Header:\r\n`
-    if value.is_empty() {
-        extend(dst, b":\r\n");
-    } else {
-        extend(dst, b": ");
-        extend(dst, value.as_bytes());
-        extend(dst, b"\r\n");
+fn write_header_value_line(
+    dst: &mut Vec<u8>,
+    value: &HeaderValue,
+    spacing: Option<&crate::ext::FieldSpacing>,
+) {
+    match spacing {
+        Some(spacing) => {
+            extend(dst, &spacing.separator);
+            extend(dst, value.as_bytes());
+            extend(dst, &spacing.trailing);
+            extend(dst, b"\r\n");
+        }
+        // Wanted for curl test cases that send `X-Custom-Header:\r\n`
+        None if value.is_empty() => extend(dst, b":\r\n"),
+        None => {
+            extend(dst, b": ");
+            extend(dst, value.as_bytes());
+            extend(dst, b"\r\n");
+        }
     }
 }
 
@@ -1765,7 +1837,7 @@ fn write_headers_original_case(
     for name in headers.keys() {
         let mut names = orig_case.get_all(name);
 
-        for value in headers.get_all(name) {
+        for (nth, value) in headers.get_all(name).iter().enumerate() {
             if let Some(orig_name) = names.next() {
                 extend(dst, orig_name.as_ref());
             } else if title_case_headers {
@@ -1774,14 +1846,7 @@ fn write_headers_original_case(
                 extend(dst, name.as_str().as_bytes());
             }
 
-            // Wanted for curl test cases that send `X-Custom-Header:\r\n`
-            if value.is_empty() {
-                extend(dst, b":\r\n");
-            } else {
-                extend(dst, b": ");
-                extend(dst, value.as_bytes());
-                extend(dst, b"\r\n");
-            }
+            write_header_value_line(dst, value, orig_case.spacing(name, nth));
         }
     }
 }

@@ -843,9 +843,12 @@ where
                 head.version = Version::HTTP_10;
             }
             Version::HTTP_11 => {
+                // A message already saying `close` keeps its `Connection` as written.
                 if let KA::Disabled = self.state.keep_alive.status() {
-                    head.headers
-                        .insert(CONNECTION, HeaderValue::from_static("close"));
+                    if !headers::connection_any_close(&head.headers) {
+                        head.headers
+                            .insert(CONNECTION, HeaderValue::from_static("close"));
+                    }
                 }
             }
             _ => (),

@@ -173,10 +173,23 @@ pub mod http2 {
 /// })
 /// ```
 ///
+/// A request a server parses with `preserve_header_case` also records the colon and
+/// whitespace around each field's value, which the HTTP/1 encoders write back around that
+/// field's value (whatever the value now is); a field without a record gets `": "`.
+///
 /// [`preserve_header_case`]: /client/struct.Client.html#method.preserve_header_case
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 #[derive(Clone, Debug)]
-pub struct HeaderCaseMap(HeaderMap<Bytes>);
+pub struct HeaderCaseMap(HeaderMap<Bytes>, HeaderMap<FieldSpacing>);
+
+/// What a parsed field line had between its name and its value (the colon and the
+/// whitespace around it), and the whitespace after its value.
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Clone, Debug)]
+pub(crate) struct FieldSpacing {
+    pub(crate) separator: Bytes,
+    pub(crate) trailing: Bytes,
+}
 
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 impl HeaderCaseMap {
@@ -196,7 +209,7 @@ impl HeaderCaseMap {
     /// An empty map, for messages whose original spelling is known to the caller
     /// (a proxy relaying a response received over another transport).
     pub fn new() -> Self {
-        Self(HeaderMap::default())
+        Self(HeaderMap::default(), HeaderMap::default())
     }
 
     #[cfg(any(feature = "client", feature = "server"))]
@@ -215,6 +228,18 @@ impl HeaderCaseMap {
         N: IntoHeaderName,
     {
         self.0.append(name, orig);
+    }
+
+    /// Records another spelling of `name` and what surrounds its value.
+    #[cfg(feature = "server")]
+    pub(crate) fn append_spaced(&mut self, name: &HeaderName, orig: Bytes, spacing: FieldSpacing) {
+        self.0.append(name, orig);
+        self.1.append(name, spacing);
+    }
+
+    /// What surrounds the `nth` value of `name`, when recorded.
+    pub(crate) fn spacing(&self, name: &HeaderName, nth: usize) -> Option<&FieldSpacing> {
+        self.1.get_all(name).iter().nth(nth)
     }
 }
 
@@ -411,6 +436,17 @@ impl PartialEq for RawChunks {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+}
+
+/// The path and query of a request-target received with raw non-ASCII bytes, as sent
+/// (`raw`) and as its `Uri` carries them percent-encoded (`encoded`). hyper inserts one
+/// into each such request a server parses; an HTTP/1 client writes `raw` for a request
+/// carrying one whose `Uri`'s path and query are still `encoded`.
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Clone, Debug)]
+pub(crate) struct RawRequestTarget {
+    pub(crate) raw: Bytes,
+    pub(crate) encoded: http::uri::PathAndQuery,
 }
 
 /// Marks a client request whose chunked response should carry a [`RawChunks`] record.
