@@ -186,9 +186,11 @@ pub struct HeaderCaseMap(HeaderMap<Bytes>, HeaderMap<FieldSpacing>);
 /// whitespace around it), and the whitespace after its value.
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 #[derive(Clone, Debug)]
-pub(crate) struct FieldSpacing {
-    pub(crate) separator: Bytes,
-    pub(crate) trailing: Bytes,
+pub struct FieldSpacing {
+    /// The colon and the whitespace around it.
+    pub separator: Bytes,
+    /// The whitespace after the value.
+    pub trailing: Bytes,
 }
 
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
@@ -238,7 +240,7 @@ impl HeaderCaseMap {
     }
 
     /// What surrounds the `nth` value of `name`, when recorded.
-    pub(crate) fn spacing(&self, name: &HeaderName, nth: usize) -> Option<&FieldSpacing> {
+    pub fn spacing(&self, name: &HeaderName, nth: usize) -> Option<&FieldSpacing> {
         self.1.get_all(name).iter().nth(nth)
     }
 }
@@ -444,9 +446,11 @@ impl PartialEq for RawChunks {
 /// carrying one whose `Uri`'s path and query are still `encoded`.
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 #[derive(Clone, Debug)]
-pub(crate) struct RawRequestTarget {
-    pub(crate) raw: Bytes,
-    pub(crate) encoded: http::uri::PathAndQuery,
+pub struct RawRequestTarget {
+    /// The path and query as sent.
+    pub raw: Bytes,
+    /// The path and query as the request's `Uri` carries them.
+    pub encoded: http::uri::PathAndQuery,
 }
 
 /// Marks a client request whose chunked response should carry a [`RawChunks`] record.
