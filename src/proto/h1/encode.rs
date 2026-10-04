@@ -14,7 +14,9 @@ use http::{
 
 use super::io::WriteBuf;
 use super::role::write_message_headers;
-use crate::ext::{HeaderCaseMap, OriginalHeaderOrder, RawChunks, RawTrailers};
+use crate::ext::{
+    FieldSpacing, HeaderCaseMap, OriginalHeaderOrder, RawChunks, RawTrailers, TrailerSpacing,
+};
 
 type StaticBuf = &'static [u8];
 
@@ -23,7 +25,7 @@ type StaticBuf = &'static [u8];
 pub(crate) struct Encoder {
     kind: Kind,
     is_last: bool,
-    raw_trailers: Option<RawTrailers>,
+    raw_trailers: Option<(RawTrailers, Option<TrailerSpacing>)>,
     raw_chunks: Option<ChunkPlan>,
 }
 
@@ -109,8 +111,11 @@ impl Encoder {
         }
     }
 
-    /// Writes the trailers with the spelling and order `raw` records, once it does.
-    pub(crate) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
+    /// Writes the trailers with the spelling, order and spacing `raw` records, once it does.
+    pub(crate) fn with_raw_trailers(
+        mut self,
+        raw: Option<(RawTrailers, Option<TrailerSpacing>)>,
+    ) -> Self {
         self.raw_trailers = raw;
         self
     }
@@ -427,14 +432,31 @@ impl Buf for Segments {
 }
 
 /// The case and order extensions that write trailers as `raw` recorded them, once it has.
-fn trailer_extensions(raw: Option<&RawTrailers>) -> http::Extensions {
+fn trailer_extensions(raw: Option<&(RawTrailers, Option<TrailerSpacing>)>) -> http::Extensions {
     let mut extensions = http::Extensions::new();
-    if let Some(fields) = raw.and_then(|raw| raw.0.get()) {
+    if let Some((raw, spacing)) = raw {
+        let Some(fields) = raw.0.get() else {
+            return extensions;
+        };
+        let spacing = spacing
+            .as_ref()
+            .and_then(|spacing| spacing.0.get())
+            .filter(|spacing| spacing.len() == fields.len());
         let mut case = HeaderCaseMap::default();
         let mut order = OriginalHeaderOrder::default();
-        for (spelling, _) in fields {
+        for (at, (spelling, _)) in fields.iter().enumerate() {
             if let Ok(name) = HeaderName::from_bytes(spelling) {
-                case.append(&name, spelling.clone());
+                match spacing.map(|spacing| &spacing[at]) {
+                    Some((separator, trailing)) => case.append_spaced(
+                        &name,
+                        spelling.clone(),
+                        FieldSpacing {
+                            separator: separator.clone(),
+                            trailing: trailing.clone(),
+                        },
+                    ),
+                    None => case.append(&name, spelling.clone()),
+                }
                 order.append(name);
             }
         }

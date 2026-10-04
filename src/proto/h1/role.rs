@@ -162,6 +162,10 @@ impl Http1Transaction for Server {
                 None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
             };
         {
+            // httparse rejects a request-target that is not UTF-8, so it parses a copy
+            // with those bytes stood in for; offsets match, and the target is taken
+            // from `buf` below.
+            let sanitized = sanitize_request_target(buf);
             let mut headers: SmallVec<[MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS]> =
                 match ctx.h1_max_headers {
                     Some(cap) => smallvec![MaybeUninit::uninit(); cap],
@@ -169,7 +173,7 @@ impl Http1Transaction for Server {
                 };
             trace!(bytes = buf.len(), "Request.parse");
             let mut req = httparse::Request::new(&mut []);
-            let bytes = buf.as_ref();
+            let bytes = sanitized.as_deref().unwrap_or(buf.as_ref());
             match ctx.h1_parser_config.parse_request_with_uninit_headers(
                 &mut req,
                 bytes,
@@ -218,15 +222,18 @@ impl Http1Transaction for Server {
         let mut raw_target = None;
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
-            if uri_bytes.is_ascii() {
+            let fragment = uri_bytes.iter().position(|&byte| byte == b'#');
+            if uri_bytes.is_ascii() && fragment.is_none() {
                 // TODO(lucab): switch to `Uri::from_shared()` once public.
                 http::Uri::from_maybe_shared(uri_bytes)?
             } else {
-                // A request-target carrying raw non-ASCII bytes (`/caf\xc3\xa9`) is
-                // malformed, but hand-rolled clients send it and origins accept
-                // it. `Uri` can't hold those bytes, so percent-encode them
-                // instead of answering 400, keeping them for a client relaying it.
-                let encoded = percent_encode_non_ascii(&uri_bytes);
+                // A request-target carrying raw non-ASCII bytes (`/caf\xc3\xa9`) or a
+                // fragment is malformed, but hand-rolled clients send it and origins
+                // accept it. `Uri` can't hold those bytes and drops a fragment, so
+                // percent-encode them instead of answering 400, keeping the target as
+                // sent for a client relaying it.
+                let encoded =
+                    percent_encode_non_ascii(&uri_bytes[..fragment.unwrap_or(uri_bytes.len())]);
                 let uri = http::Uri::from_maybe_shared(encoded.clone())?;
                 raw_target = uri.path_and_query().and_then(|encoded_pq| {
                     let start = encoded.len().checked_sub(encoded_pq.as_str().len())?;
@@ -1755,6 +1762,27 @@ pub(crate) fn encode_informational(
     extend(dst, b"\r\n");
     write_message_headers(&head.headers, &head.extensions, dst, title_case_headers);
     extend(dst, b"\r\n");
+}
+
+/// A copy of `buf` whose request line has its non-ASCII bytes after the method
+/// replaced, when that line is not UTF-8.
+#[cfg(feature = "server")]
+fn sanitize_request_target(buf: &[u8]) -> Option<Vec<u8>> {
+    let line = &buf[..buf
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .unwrap_or(buf.len())];
+    let target = line.iter().position(|&byte| byte == b' ')?;
+    if std::str::from_utf8(line).is_ok() || !line[..target].is_ascii() {
+        return None;
+    }
+    let mut copy = buf.to_vec();
+    for byte in &mut copy[target..line.len()] {
+        if !byte.is_ascii() {
+            *byte = b'x';
+        }
+    }
+    Some(copy)
 }
 
 /// Percent-encodes every non-ASCII byte of a request-target so `http::Uri` can

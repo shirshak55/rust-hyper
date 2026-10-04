@@ -74,6 +74,7 @@ pub struct Builder {
     timer: Time,
     h1_half_close: bool,
     h1_keep_alive: bool,
+    h1_announce_close: bool,
     h1_title_case_headers: bool,
     h1_preserve_header_case: bool,
     h1_informational: bool,
@@ -250,6 +251,7 @@ impl Builder {
             timer: Time::Empty,
             h1_half_close: false,
             h1_keep_alive: true,
+            h1_announce_close: true,
             h1_title_case_headers: false,
             h1_preserve_header_case: false,
             h1_informational: false,
@@ -284,6 +286,17 @@ impl Builder {
     /// Default is `true`.
     pub fn keep_alive(&mut self, val: bool) -> &mut Self {
         self.h1_keep_alive = val;
+        self
+    }
+
+    /// Set whether a response written after keep-alive was turned off, as by
+    /// `graceful_shutdown`, says `Connection: close`.
+    ///
+    /// When disabled, the response goes as given and the connection closes after it.
+    ///
+    /// Default is `true`.
+    pub fn announce_close(&mut self, val: bool) -> &mut Self {
+        self.h1_announce_close = val;
         self
     }
 
@@ -552,6 +565,9 @@ impl Builder {
         }
         if self.h1_half_close {
             conn.set_allow_half_close();
+        }
+        if !self.h1_announce_close {
+            conn.set_quiet_close();
         }
         if self.h1_title_case_headers {
             conn.set_title_case_headers();

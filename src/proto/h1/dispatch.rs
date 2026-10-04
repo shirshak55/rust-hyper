@@ -187,6 +187,11 @@ where
             let _ = self.poll_read(cx)?;
             let write_ready = self.poll_write(cx)?.is_ready();
             let flush_ready = self.poll_flush(cx)?.is_ready();
+            #[cfg(feature = "client")]
+            let _ = self
+                .conn
+                .poll_relay_half_close(cx)
+                .map_err(crate::Error::new_shutdown)?;
 
             // If we can write more body and the connection is ready, we should
             // write again. If we return `Ready(Ok(())` here, we will yield
@@ -425,6 +430,8 @@ where
                     ready!(self.conn.poll_expect_continue(cx));
 
                     let item = ready!(body.as_mut().poll_frame(cx));
+                    #[cfg(feature = "client")]
+                    self.conn.sending_body();
                     if let Some(item) = item {
                         let frame = item.map_err(|e| {
                             *clear_body = true;

@@ -233,7 +233,6 @@ impl HeaderCaseMap {
     }
 
     /// Records another spelling of `name` and what surrounds its value.
-    #[cfg(feature = "server")]
     pub(crate) fn append_spaced(&mut self, name: &HeaderName, orig: Bytes, spacing: FieldSpacing) {
         self.0.append(name, orig);
         self.1.append(name, spacing);
@@ -406,6 +405,18 @@ impl Default for OriginalHeaderOrder {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, http::HeaderValue)>>>);
 
+/// What each of an HTTP/1 message's trailer fields had between its name and its value
+/// (the colon included), and after its value up to its line ending, in the order of its
+/// [`RawTrailers`].
+///
+/// hyper inserts one next to each `RawTrailers` it inserts into an HTTP/1 message and
+/// fills it as it reads the trailers. An HTTP/1 message hyper writes carrying a filled one
+/// with its `RawTrailers` writes its trailers so. Clones share the record, like
+/// `RawTrailers`.
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrailerSpacing(pub Arc<OnceLock<Vec<(Bytes, Bytes)>>>);
+
 /// A chunked HTTP/1 body's chunk-size lines as received, in order: each chunk's size and
 /// its line as sent (the size digits' spelling, any whitespace, and the chunk
 /// extensions, without the CRLF), the last chunk (size 0) included.
@@ -453,6 +464,57 @@ pub struct RawRequestTarget {
     pub encoded: http::uri::PathAndQuery,
 }
 
+/// Relays an HTTP/1 client's half-close. hyper inserts one into each request a server
+/// connection built with [`half_close`](crate::server::conn::http1::Builder::half_close)
+/// reads, and marks it when the client ends its sending side mid-message. An HTTP/1
+/// client connection writing a request carrying one ends its own sending side once it
+/// has written the request and the mark is set, as the client did.
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Clone, Debug, Default)]
+pub struct ReadClosed(Arc<ReadClosedMark>);
+
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+#[derive(Debug, Default)]
+struct ReadClosedMark {
+    closed: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+impl ReadClosed {
+    #[cfg(feature = "server")]
+    pub(crate) fn close(&self) {
+        self.0
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let waker = self
+            .0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    #[cfg(feature = "client")]
+    pub(crate) fn poll_closed(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let closed = || self.0.closed.load(std::sync::atomic::Ordering::Acquire);
+        if !closed() {
+            *self
+                .0
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.waker().clone());
+            if !closed() {
+                return std::task::Poll::Pending;
+            }
+        }
+        std::task::Poll::Ready(())
+    }
+}
+
 /// Marks a client request whose chunked response should carry a [`RawChunks`] record.
 #[cfg(all(feature = "client", feature = "http1"))]
 #[derive(Clone, Copy, Debug)]
@@ -476,8 +538,7 @@ pub fn record_response_chunks<B>(req: &mut http::Request<B>) {
 #[cfg(all(feature = "client", feature = "http1"))]
 #[derive(Clone)]
 pub struct ExpectContinue {
-    pub(crate) timer: Arc<dyn crate::rt::Timer + Send + Sync>,
-    pub(crate) timeout: std::time::Duration,
+    pub(crate) wait: Option<(Arc<dyn crate::rt::Timer + Send + Sync>, std::time::Duration)>,
 }
 
 #[cfg(all(feature = "client", feature = "http1"))]
@@ -489,9 +550,15 @@ impl ExpectContinue {
         T: crate::rt::Timer + Send + Sync + 'static,
     {
         Self {
-            timer: Arc::new(timer),
-            timeout,
+            wait: Some((Arc::new(timer), timeout)),
         }
+    }
+
+    /// Sends the body as soon as it yields data, for a body whose producer already waits
+    /// for `100 Continue` (a proxy relaying its client's body). A final response arriving
+    /// before any of the body was written still closes the connection after it.
+    pub fn relayed() -> Self {
+        Self { wait: None }
     }
 }
 
@@ -499,7 +566,7 @@ impl ExpectContinue {
 impl fmt::Debug for ExpectContinue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExpectContinue")
-            .field("timeout", &self.timeout)
+            .field("timeout", &self.wait.as_ref().map(|(_, timeout)| timeout))
             .finish()
     }
 }

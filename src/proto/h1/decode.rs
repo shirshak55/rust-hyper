@@ -11,7 +11,7 @@ use http_body::Frame;
 use super::io::MemRead;
 use super::role::DEFAULT_MAX_HEADERS;
 use super::DecodedLength;
-use crate::ext::{RawChunks, RawTrailers};
+use crate::ext::{RawChunks, RawTrailers, TrailerSpacing};
 
 use self::Kind::{Chunked, Eof, Length};
 
@@ -47,7 +47,7 @@ enum Kind {
         trailers_cnt: usize,
         h1_max_headers: Option<usize>,
         h1_max_header_size: Option<usize>,
-        raw_trailers: Option<RawTrailers>,
+        raw_trailers: Option<(RawTrailers, TrailerSpacing)>,
         raw_chunks: Option<RawChunks>,
         /// The chunk-size line being read, for `raw_chunks`.
         raw_line: BytesMut,
@@ -136,7 +136,7 @@ impl Decoder {
     }
 
     /// Records a chunked body's trailer fields as sent into `raw` when it reads them.
-    pub(super) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
+    pub(super) fn with_raw_trailers(mut self, raw: Option<(RawTrailers, TrailerSpacing)>) -> Self {
         if let Chunked { raw_trailers, .. } = &mut self.kind {
             *raw_trailers = raw;
         }
@@ -711,10 +711,11 @@ impl ChunkedState {
 fn decode_trailers(
     buf: &mut BytesMut,
     count: usize,
-    raw: Option<&RawTrailers>,
+    raw: Option<&(RawTrailers, TrailerSpacing)>,
 ) -> Result<HeaderMap, io::Error> {
     let mut trailers = HeaderMap::new();
     let mut raw_fields = Vec::new();
+    let mut spacings = Vec::new();
     let mut headers = vec![httparse::EMPTY_HEADER; count];
     let res = httparse::parse_headers(buf, &mut headers);
     match res {
@@ -742,13 +743,18 @@ fn decode_trailers(
                 };
 
                 if raw.is_some() {
-                    raw_fields.push((Bytes::copy_from_slice(header.name.as_bytes()), value.clone()));
+                    raw_fields.push((
+                        Bytes::copy_from_slice(header.name.as_bytes()),
+                        value.clone(),
+                    ));
+                    spacings.push(trailer_spacing(buf, header));
                 }
                 trailers.append(name, value);
             }
 
-            if let Some(raw) = raw {
+            if let Some((raw, spacing)) = raw {
                 raw.0.get_or_init(|| raw_fields);
+                spacing.0.get_or_init(|| spacings);
             }
             Ok(trailers)
         }
@@ -758,6 +764,23 @@ fn decode_trailers(
         )),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
     }
+}
+
+/// What `header`, parsed from `buf`, has between its name and its value, and after its
+/// value up to its line ending.
+fn trailer_spacing(buf: &[u8], header: &httparse::Header<'_>) -> (Bytes, Bytes) {
+    let base = buf.as_ptr() as usize;
+    let name_end = header.name.as_ptr() as usize - base + header.name.len();
+    let value_start = header.value.as_ptr() as usize - base;
+    let value_end = value_start + header.value.len();
+    let line_end = buf[value_end..]
+        .iter()
+        .position(|&byte| byte == b'\r' || byte == b'\n')
+        .map_or(buf.len(), |at| value_end + at);
+    (
+        Bytes::copy_from_slice(&buf[name_end..value_start]),
+        Bytes::copy_from_slice(&buf[value_end..line_end]),
+    )
 }
 
 #[derive(Debug)]

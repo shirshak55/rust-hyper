@@ -51,7 +51,12 @@ where
         Conn {
             io: Buffered::new(io),
             state: State {
-                allow_half_close: false,
+                announce_close: true,
+                #[cfg(feature = "server")]
+                half_closed: None,
+                #[cfg(feature = "client")]
+                relay_half_close: None,
+                write_shut_down: false,
                 cached_headers: None,
                 error: None,
                 keep_alive: KA::Busy,
@@ -161,6 +166,11 @@ where
     pub(crate) fn set_preserve_response_version(&mut self) {
         self.state.preserve_response_version = true;
     }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_quiet_close(&mut self) {
+        self.state.announce_close = false;
+    }
     #[cfg(feature = "client")]
     pub(crate) fn set_preserve_header_order(&mut self) {
         self.state.preserve_header_order = true;
@@ -187,7 +197,7 @@ where
 
     #[cfg(feature = "server")]
     pub(crate) fn set_allow_half_close(&mut self) {
-        self.state.allow_half_close = true;
+        self.state.half_closed = Some(crate::ext::ReadClosed::default());
     }
 
     #[cfg(feature = "server")]
@@ -358,11 +368,17 @@ where
         let raw_trailers =
             if self.state.preserve_header_case && msg.decode == DecodedLength::CHUNKED {
                 let raw = crate::ext::RawTrailers::default();
+                let spacing = crate::ext::TrailerSpacing::default();
                 msg.head.extensions.insert(raw.clone());
-                Some(raw)
+                msg.head.extensions.insert(spacing.clone());
+                Some((raw, spacing))
             } else {
                 None
             };
+        #[cfg(feature = "server")]
+        if let Some(half_closed) = &self.state.half_closed {
+            msg.head.extensions.insert(half_closed.clone());
+        }
         let raw_chunks = if self.state.records_chunks::<T>() && msg.decode == DecodedLength::CHUNKED
         {
             let raw = crate::ext::RawChunks::default();
@@ -560,13 +576,20 @@ where
         debug_assert!(!self.can_read_head() && !self.can_read_body() && !self.is_read_closed());
         debug_assert!(self.is_mid_message());
 
-        if self.state.allow_half_close || !self.io.read_buf().is_empty() {
+        if !self.io.read_buf().is_empty() {
             return Poll::Pending;
         }
 
         let num_read = ready!(self.force_io_read(cx)).map_err(crate::Error::new_io)?;
 
         if num_read == 0 {
+            #[cfg(feature = "server")]
+            if let Some(half_closed) = &self.state.half_closed {
+                trace!("client half-closed mid-message");
+                half_closed.close();
+                self.state.close_read();
+                return Poll::Pending;
+            }
             trace!("found unexpected EOF on busy connection: {:?}", self.state);
             self.state.close_read();
             Poll::Ready(Err(crate::Error::new_incomplete()))
@@ -742,7 +765,12 @@ where
             self.state.disable_keep_alive();
         }
 
-        let raw_trailers = head.extensions.get::<crate::ext::RawTrailers>().cloned();
+        let spacing = head.extensions.get::<crate::ext::TrailerSpacing>().cloned();
+        let raw_trailers = head
+            .extensions
+            .get::<crate::ext::RawTrailers>()
+            .cloned()
+            .map(|raw| (raw, spacing));
         let raw_chunks = head.extensions.get::<crate::ext::RawChunks>().cloned();
         let buf = self.io.headers_buf();
         match super::role::encode_headers::<T>(
@@ -773,11 +801,13 @@ where
                         .extensions
                         .remove::<crate::ext::RecordResponseChunks>()
                         .is_some();
+                    self.state.relay_half_close =
+                        head.extensions.remove::<crate::ext::ReadClosed>();
                     self.state.expect_continue = head
                         .extensions
                         .remove::<crate::ext::ExpectContinue>()
                         .filter(|_| expects_continue && !encoder.is_eof())
-                        .map(|expect| expect.timer.sleep(expect.timeout));
+                        .map(|expect| expect.wait.map(|(timer, timeout)| timer.sleep(timeout)));
                 }
 
                 Some(
@@ -851,7 +881,8 @@ where
                 // A message already saying `close`, or switching protocols, keeps its
                 // `Connection` as written.
                 if let KA::Disabled = self.state.keep_alive.status() {
-                    if !headers::connection_any_close(&head.headers)
+                    if self.state.announce_close
+                        && !headers::connection_any_close(&head.headers)
                         && !headers::upgrading(&head.headers)
                     {
                         head.headers
@@ -895,12 +926,18 @@ where
     /// or the wait timed out.
     #[cfg(feature = "client")]
     pub(crate) fn poll_expect_continue(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(wait) = &mut self.state.expect_continue {
+        if let Some(Some(wait)) = &mut self.state.expect_continue {
             ready!(wait.as_mut().poll(cx));
             debug!("no 100 Continue before the timeout; sending the request body");
             self.state.expect_continue = None;
         }
         Poll::Ready(())
+    }
+
+    /// The request body is going out, so a final response no longer cuts it off.
+    #[cfg(feature = "client")]
+    pub(crate) fn sending_body(&mut self) {
+        self.state.expect_continue = None;
     }
 
     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) -> crate::Result<()> {
@@ -1027,9 +1064,13 @@ where
     }
 
     pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.write_shut_down {
+            return Poll::Ready(Ok(()));
+        }
         match ready!(self.io.poll_shutdown(cx)) {
             Ok(()) => {
                 trace!("shut down IO complete");
+                self.state.write_shut_down = true;
                 Poll::Ready(Ok(()))
             }
             Err(e) => {
@@ -1037,6 +1078,24 @@ where
                 Poll::Ready(Err(e))
             }
         }
+    }
+
+    /// Ends the sending side once the request is written, when the client the request
+    /// relays ended its own.
+    #[cfg(feature = "client")]
+    pub(crate) fn poll_relay_half_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(half_closed) = &self.state.relay_half_close else {
+            return Poll::Ready(Ok(()));
+        };
+        if !matches!(self.state.writing, Writing::KeepAlive | Writing::Closed) {
+            return Poll::Ready(Ok(()));
+        }
+        ready!(half_closed.poll_closed(cx));
+        ready!(self.poll_shutdown(cx))?;
+        trace!("relayed the client's half-close");
+        self.state.relay_half_close = None;
+        self.state.close_write();
+        Poll::Ready(Ok(()))
     }
 
     /// If the read side can be cheaply drained, do so. Otherwise, close.
@@ -1104,7 +1163,16 @@ impl<I, B: Buf, T> fmt::Debug for Conn<I, B, T> {
 impl<I: Unpin, B, T> Unpin for Conn<I, B, T> {}
 
 struct State {
-    allow_half_close: bool,
+    /// Say `Connection: close` on a message written after keep-alive was disabled.
+    announce_close: bool,
+    /// With half-closes allowed, marked when the client half-closes mid-message.
+    #[cfg(feature = "server")]
+    half_closed: Option<crate::ext::ReadClosed>,
+    /// The half-close of the client the request being written relays.
+    #[cfg(feature = "client")]
+    relay_half_close: Option<crate::ext::ReadClosed>,
+    /// The sending side is shut down.
+    write_shut_down: bool,
     /// Re-usable `HeaderMap` to reduce allocating new ones.
     cached_headers: Option<HeaderMap>,
     /// If an error occurs when there wasn't a direct way to return it
@@ -1140,9 +1208,10 @@ struct State {
     /// received.
     #[cfg(feature = "client")]
     on_informational: Option<crate::ext::OnInformational>,
-    /// While set, the request body waits for `100 Continue` until this sleep ends.
+    /// Set until the request body starts, which waits for `100 Continue` until this sleep
+    /// ends.
     #[cfg(feature = "client")]
-    expect_continue: Option<Pin<Box<dyn Sleep>>>,
+    expect_continue: Option<Option<Pin<Box<dyn Sleep>>>>,
     /// Record the chunk-size lines of the current request's chunked response.
     record_response_chunks: bool,
     /// Write `100 Continue` when a request body sent with `Expect: 100-continue` is
@@ -1199,7 +1268,8 @@ impl fmt::Debug for State {
             builder.field("error", error);
         }
 
-        if self.allow_half_close {
+        #[cfg(feature = "server")]
+        if self.half_closed.is_some() {
             builder.field("allow_half_close", &true);
         }
 
@@ -1325,6 +1395,10 @@ impl State {
 
         self.method = None;
         self.keep_alive.idle();
+        #[cfg(feature = "client")]
+        {
+            self.relay_half_close = None;
+        }
 
         if !self.is_idle() {
             self.close();
