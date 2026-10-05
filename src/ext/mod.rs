@@ -429,8 +429,12 @@ pub struct TrailerSpacing(pub Arc<OnceLock<Vec<(Bytes, Bytes)>>>);
 /// recorded sizes and writes each recorded line, whatever frames the body yields, so a
 /// proxy relaying a received body keeps its chunks and their extensions; bytes past the
 /// record go out one chunk per frame, and a body ending inside a recorded chunk is an
-/// error. Clones share the lines, so a proxy can hand a received message's record (or its
-/// cell, to another HTTP library) to the message it relays as the lines arrive.
+/// error. It drops each line from the record once written, so a long body's record holds
+/// only the lines still to go out (the last chunk's stays). Clones share the lines, so a
+/// proxy can hand a received message's record (or its cell, to another HTTP library) to
+/// the message it relays as the lines arrive; one also reading them takes them from the
+/// received record as they arrive, handing them on to a record of its own that the
+/// relayed message carries.
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 #[derive(Clone, Debug, Default)]
 pub struct RawChunks(pub Arc<std::sync::Mutex<Vec<(u64, Bytes)>>>);
