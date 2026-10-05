@@ -1101,6 +1101,15 @@ where
     /// If the read side can be cheaply drained, do so. Otherwise, close.
     pub(super) fn poll_drain_or_close_read(&mut self, cx: &mut Context<'_>) {
         if let Reading::Continue(decoder) = &mut self.state.reading {
+            // A client not told to send its body (no 100 Continue went out) that sent none
+            // of it takes the final response as told not to: its next bytes are its next
+            // request, as for an origin keeping the connection after answering so.
+            if self.io.read_buf().is_empty() && self.io.poll_read_from_io(cx).is_pending() {
+                trace!("body never sent");
+                self.state.reading = Reading::KeepAlive;
+                self.try_keep_alive(cx);
+                return;
+            }
             // skip sending the 100-continue
             // just move forward to a read, in case a tiny body was included
             self.state.reading = Reading::Body(decoder.clone());
