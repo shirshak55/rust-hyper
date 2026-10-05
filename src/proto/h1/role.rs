@@ -1765,19 +1765,22 @@ pub(crate) fn encode_informational(
 }
 
 /// A copy of `buf` whose request line has its non-ASCII bytes after the method
-/// replaced, when that line is not UTF-8.
+/// replaced, when that line is not UTF-8. The empty lines httparse skips ahead of the
+/// request line (RFC 9112 §2.2) are skipped here too.
 #[cfg(feature = "server")]
 fn sanitize_request_target(buf: &[u8]) -> Option<Vec<u8>> {
-    let line = &buf[..buf
+    let start = buf.iter().position(|&byte| byte != b'\r' && byte != b'\n')?;
+    let line = &buf[start..];
+    let line = &line[..line
         .iter()
         .position(|&byte| byte == b'\n')
-        .unwrap_or(buf.len())];
+        .unwrap_or(line.len())];
     let target = line.iter().position(|&byte| byte == b' ')?;
     if std::str::from_utf8(line).is_ok() || !line[..target].is_ascii() {
         return None;
     }
     let mut copy = buf.to_vec();
-    for byte in &mut copy[target..line.len()] {
+    for byte in &mut copy[start + target..start + line.len()] {
         if !byte.is_ascii() {
             *byte = b'x';
         }
