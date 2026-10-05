@@ -85,6 +85,7 @@ where
                 expect_continue: None,
                 record_response_chunks: false,
                 auto_continue: true,
+                held_body: None,
                 preserve_chunks: false,
                 preserve_response_version: false,
                 notify_read: false,
@@ -398,11 +399,11 @@ where
             }
         } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
-            self.state.reading = Reading::Continue(
-                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
-                    .with_raw_trailers(raw_trailers)
-                    .with_raw_chunks(raw_chunks),
-            );
+            let decoder = Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                .with_raw_trailers(raw_trailers)
+                .with_raw_chunks(raw_chunks);
+            self.state.held_body = Some(decoder.clone());
+            self.state.reading = Reading::Continue(decoder);
             wants = wants.add(Wants::EXPECT);
         } else {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
@@ -496,6 +497,7 @@ where
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
                     self.io.headers_buf().extend_from_slice(cont);
+                    self.state.held_body = None;
                 }
 
                 // And now recurse once in the Reading::Body state...
@@ -708,6 +710,9 @@ where
                 head.subject
             );
             return;
+        }
+        if head.subject == http::StatusCode::CONTINUE {
+            self.state.held_body = None;
         }
         let buf = self.io.headers_buf();
         super::role::encode_informational(&head, buf, self.state.title_case_headers);
@@ -1100,16 +1105,22 @@ where
 
     /// If the read side can be cheaply drained, do so. Otherwise, close.
     pub(super) fn poll_drain_or_close_read(&mut self, cx: &mut Context<'_>) {
-        if let Reading::Continue(decoder) = &mut self.state.reading {
-            // A client not told to send its body (no 100 Continue went out) that sent none
-            // of it takes the final response as told not to: its next bytes are its next
-            // request, as for an origin keeping the connection after answering so.
-            if self.io.read_buf().is_empty() && self.io.poll_read_from_io(cx).is_pending() {
-                trace!("body never sent");
-                self.state.reading = Reading::KeepAlive;
-                self.try_keep_alive(cx);
-                return;
+        // A client not told to send its body (no 100 Continue went out) that sent none of it
+        // takes the final response as told not to: its next bytes are its next request, as
+        // for an origin keeping the connection after answering so.
+        let held = match &self.state.reading {
+            Reading::Continue(decoder) | Reading::Body(decoder) => {
+                self.state.held_body.as_ref() == Some(decoder)
             }
+            _ => false,
+        };
+        if held && self.io.read_buf().is_empty() && self.io.poll_read_from_io(cx).is_pending() {
+            trace!("body never sent");
+            self.state.reading = Reading::KeepAlive;
+            self.try_keep_alive(cx);
+            return;
+        }
+        if let Reading::Continue(decoder) = &mut self.state.reading {
             // skip sending the 100-continue
             // just move forward to a read, in case a tiny body was included
             self.state.reading = Reading::Body(decoder.clone());
@@ -1226,6 +1237,9 @@ struct State {
     /// Write `100 Continue` when a request body sent with `Expect: 100-continue` is
     /// first read.
     auto_continue: bool,
+    /// The body of a request with `Expect: 100-continue` as it stood before any of it was
+    /// read, until a `100 Continue` went out.
+    held_body: Option<Decoder>,
     /// Record the chunk-size lines of chunked requests.
     preserve_chunks: bool,
     /// Keep a response's version when the client speaks HTTP/1.0.
@@ -1404,6 +1418,7 @@ impl State {
 
         self.method = None;
         self.keep_alive.idle();
+        self.held_body = None;
         #[cfg(feature = "client")]
         {
             self.relay_half_close = None;
