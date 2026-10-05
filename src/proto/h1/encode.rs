@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::IoSlice;
 
 use bytes::buf::{Chain, Take};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use http::{
     header::{
         AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
@@ -75,6 +75,10 @@ enum BufKind<B> {
 /// Byte runs written in order: body data split and framed at recorded chunk sizes.
 #[derive(Debug, Default)]
 struct Segments(VecDeque<Bytes>);
+
+/// Data shorter than this goes out copied in with the framing around it, so a body of
+/// many small chunks is written as a few runs rather than as four per chunk.
+const COPIED_DATA: usize = 1024;
 
 impl Encoder {
     fn new(kind: Kind) -> Encoder {
@@ -366,37 +370,55 @@ impl ChunkPlan {
     /// Frames `msg` as the rest of the chunk being written and the recorded chunks after
     /// it; bytes past the record go out as one chunk.
     fn encode<B: Buf>(&mut self, mut msg: B) -> Segments {
-        const CRLF: Bytes = Bytes::from_static(b"\r\n");
         let mut lines = self.record.lock();
         let mut written = 0;
         let mut out = Segments::default();
+        let mut run = BytesMut::new();
         while msg.has_remaining() {
             if self.remaining == 0 {
                 match lines.get(written) {
                     Some((size, line)) if *size > 0 => {
-                        out.0.push_back(line.clone());
-                        out.0.push_back(CRLF);
+                        run.extend_from_slice(line);
+                        run.extend_from_slice(b"\r\n");
                         self.remaining = *size;
                         written += 1;
                     }
                     _ => {
                         let len = msg.remaining();
-                        out.0.push_back(Bytes::from(format!("{len:X}\r\n")));
-                        out.0.push_back(msg.copy_to_bytes(len));
-                        out.0.push_back(CRLF);
+                        run.extend_from_slice(format!("{len:X}\r\n").as_bytes());
+                        out.push_data(&mut run, msg.copy_to_bytes(len));
+                        run.extend_from_slice(b"\r\n");
                         break;
                     }
                 }
             }
             let len = msg.remaining().min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
-            out.0.push_back(msg.copy_to_bytes(len));
+            out.push_data(&mut run, msg.copy_to_bytes(len));
             self.remaining -= len as u64;
             if self.remaining == 0 {
-                out.0.push_back(CRLF);
+                run.extend_from_slice(b"\r\n");
             }
+        }
+        if !run.is_empty() {
+            out.0.push_back(run.freeze());
         }
         lines.drain(..written);
         out
+    }
+}
+
+impl Segments {
+    /// Adds `data` to `run`, the bytes copied together, when it is short; otherwise ends
+    /// `run` and adds `data` as it is.
+    fn push_data(&mut self, run: &mut BytesMut, data: Bytes) {
+        if data.len() < COPIED_DATA {
+            run.extend_from_slice(&data);
+        } else {
+            if !run.is_empty() {
+                self.0.push_back(run.split().freeze());
+            }
+            self.0.push_back(data);
+        }
     }
 }
 
