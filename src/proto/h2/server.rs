@@ -399,6 +399,11 @@ where
                             req.extensions_mut().insert(tx);
                             rx
                         });
+                        let stream_reset = self.reset_requests.is_some().then(|| {
+                            let reset = crate::ext::StreamReset::default();
+                            req.extensions_mut().insert(reset.clone());
+                            reset
+                        });
 
                         let fut = H2Stream::new(
                             service.call(req),
@@ -408,6 +413,7 @@ where
                             informational,
                             exec.clone(),
                             self.reset_requests.clone(),
+                            stream_reset,
                         );
 
                         exec.execute_h2stream(fut);
@@ -471,8 +477,9 @@ pin_project! {
         turns: Vec<Arc<PushTurn>>,
         exec: E,
         reset_requests: Option<ResetRequests>,
-        // Its client's reset, while the service runs on.
+        // Its client's reset, while the service runs on, which it tells the service.
         reset: Option<(ResetRequest, Reason)>,
+        stream_reset: Option<crate::ext::StreamReset>,
     }
 }
 
@@ -516,6 +523,7 @@ where
         informational: Option<InformationalReceiver>,
         exec: E,
         reset_requests: Option<ResetRequests>,
+        stream_reset: Option<crate::ext::StreamReset>,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
@@ -527,6 +535,7 @@ where
             exec,
             reset_requests,
             reset: None,
+            stream_reset,
         }
     }
 }
@@ -740,7 +749,14 @@ where
                             {
                                 debug!("stream received RST_STREAM: {:?}", reason);
                                 match me.reset_requests.as_ref().and_then(ResetRequests::take) {
-                                    Some(request) => *me.reset = Some((request, reason)),
+                                    Some(request) => {
+                                        *me.reset = Some((request, reason));
+                                        // Its interim heads go nowhere either.
+                                        *me.informational = None;
+                                        if let Some(stream_reset) = me.stream_reset.as_ref() {
+                                            stream_reset.reset(reason.into());
+                                        }
+                                    }
                                     None => {
                                         return Poll::Ready(Err(crate::Error::new_h2(
                                             reason.into(),

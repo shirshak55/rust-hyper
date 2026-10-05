@@ -367,7 +367,8 @@ impl<E> Builder<E> {
     /// intermediary relay the request and its reset as the client sent them. At most as
     /// many such requests run at once as
     /// [`max_concurrent_streams`](Self::max_concurrent_streams) allows (any number without
-    /// it); those past it are dropped.
+    /// it); those past it are dropped. Each request carries a
+    /// [`StreamReset`](crate::ext::StreamReset) telling the service of its reset.
     ///
     /// By default the service's future is dropped.
     pub fn serve_reset_requests(&mut self) -> &mut Self {

@@ -515,6 +515,55 @@ impl ReadClosed {
     }
 }
 
+/// An HTTP/2 request's stream ending in a reset before its response: hyper inserts one
+/// into each request a server connection built with
+/// [`serve_reset_requests`](crate::server::conn::http2::Builder::serve_reset_requests)
+/// hands over, and marks it with the reset's error code when the stream is reset (by its
+/// client, or refused under a relayed `GOAWAY`) while the service runs on, its response
+/// then going nowhere.
+#[cfg(all(feature = "http2", feature = "server"))]
+#[derive(Clone, Debug, Default)]
+pub struct StreamReset(Arc<StreamResetMark>);
+
+#[cfg(all(feature = "http2", feature = "server"))]
+#[derive(Debug, Default)]
+struct StreamResetMark {
+    code: std::sync::OnceLock<u32>,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+#[cfg(all(feature = "http2", feature = "server"))]
+impl StreamReset {
+    pub(crate) fn reset(&self, code: u32) {
+        let _ = self.0.code.set(code);
+        let waker = self
+            .0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// The reset's error code once the stream was reset; otherwise wakes `cx` when it is.
+    pub fn poll_reset(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<u32> {
+        if let Some(code) = self.0.code.get() {
+            return std::task::Poll::Ready(*code);
+        }
+        *self
+            .0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.waker().clone());
+        match self.0.code.get() {
+            Some(code) => std::task::Poll::Ready(*code),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// Marks a client request whose chunked response should carry a [`RawChunks`] record.
 #[cfg(all(feature = "client", feature = "http1"))]
 #[derive(Clone, Copy, Debug)]
