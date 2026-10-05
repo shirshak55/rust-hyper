@@ -351,8 +351,11 @@ where
         {
             self.state.on_informational = None;
             if self.state.expect_continue.take().is_some() {
+                // None of the body went out: the request ends at its head, as a client's that
+                // keeps its connection after such a response does, so the connection stays
+                // usable.
                 debug!("final response before 100 Continue; not sending the request body");
-                self.state.close_write();
+                self.state.writing = Writing::KeepAlive;
             }
         }
 
