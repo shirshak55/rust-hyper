@@ -15,9 +15,9 @@ use crate::ext::{RawChunks, RawTrailers, TrailerSpacing};
 
 use self::Kind::{Chunked, Eof, Length};
 
-/// Maximum amount of bytes allowed in chunked extensions.
+/// Maximum amount of bytes allowed in a chunk's extensions.
 ///
-/// This limit is currentlty applied for the entire body, not per chunk.
+/// This limit is applied per chunk-size line, not for the entire body.
 const CHUNKED_EXTENSIONS_LIMIT: u64 = 1024 * 16;
 
 /// Maximum number of bytes allowed for all trailer fields.
@@ -537,7 +537,10 @@ impl ChunkedState {
         // them from themselves, we reject extensions containing plain LF as
         // well.
         match byte!(rdr, cx) {
-            b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
+            b'\r' => {
+                *extensions_cnt = 0;
+                Poll::Ready(Ok(ChunkedState::SizeLf))
+            }
             b'\n' => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid chunk extension contains newline",
@@ -1084,8 +1087,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_chunked_extensions_over_limit() {
-        // construct a chunked body where each individual chunked extension
-        // is totally fine, but combined is over the limit.
+        // construct a chunked body where each chunk's extensions are fine,
+        // though combined over the limit, then a chunk whose own are over it.
         let per_chunk = super::CHUNKED_EXTENSIONS_LIMIT * 2 / 3;
         let mut scratch = vec![];
         for _ in 0..2 {
@@ -1093,6 +1096,9 @@ mod tests {
             scratch.extend(b"x".repeat(per_chunk as usize));
             scratch.extend(b"\r\nA\r\n");
         }
+        scratch.extend(b"1;");
+        scratch.extend(b"x".repeat(super::CHUNKED_EXTENSIONS_LIMIT as usize));
+        scratch.extend(b"\r\nA\r\n");
         scratch.extend(b"0\r\n\r\n");
         let mut mock_buf = Bytes::from(scratch);
 
@@ -1103,7 +1109,7 @@ mod tests {
             .expect("decode1")
             .into_data()
             .expect("unknown frame type");
-        assert_eq!(&buf1[..], b"A");
+        assert_eq!(&buf1[..], b"AA");
 
         let err = decoder
             .decode_fut(&mut mock_buf)

@@ -881,6 +881,14 @@ impl Server {
                                 || msg.head.subject == StatusCode::NOT_MODIFIED
                             {
                                 debug_assert_eq!(encoder, Encoder::length(0));
+                            } else if headers::content_length_parse(&value) == Some(0)
+                                && Server::can_have_implicit_zero_content_length(
+                                    msg.req_method.as_ref(),
+                                    msg.head.subject,
+                                )
+                            {
+                                // Written where it was, not after the other fields.
+                                debug_assert_eq!(encoder, Encoder::length(0));
                             } else {
                                 if value.as_bytes() != b"0" {
                                     warn!(

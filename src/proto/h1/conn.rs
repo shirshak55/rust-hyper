@@ -351,11 +351,8 @@ where
         {
             self.state.on_informational = None;
             if self.state.expect_continue.take().is_some() {
-                // None of the body went out: the request ends at its head, as a client's that
-                // keeps its connection after such a response does, so the connection stays
-                // usable.
                 debug!("final response before 100 Continue; not sending the request body");
-                self.state.writing = Writing::KeepAlive;
+                self.state.close_write();
             }
         }
 
@@ -1108,20 +1105,18 @@ where
 
     /// If the read side can be cheaply drained, do so. Otherwise, close.
     pub(super) fn poll_drain_or_close_read(&mut self, cx: &mut Context<'_>) {
-        // A client not told to send its body (no 100 Continue went out) that sent none of it
-        // takes the final response as told not to: its next bytes are its next request, as
-        // for an origin keeping the connection after answering so.
+        // A client not told to send its body (no 100 Continue went out) and that sent none
+        // of it may still send it, or send its next request instead: which its next bytes
+        // are can't be told, so the connection ends after the response.
         let held = match &self.state.reading {
             Reading::Continue(decoder) | Reading::Body(decoder) => {
                 self.state.held_body.as_ref() == Some(decoder)
             }
             _ => false,
         };
-        if held && self.io.read_buf().is_empty() && self.io.poll_read_from_io(cx).is_pending() {
-            trace!("body never sent");
-            self.state.reading = Reading::KeepAlive;
-            self.try_keep_alive(cx);
-            return;
+        if held {
+            trace!("body held back for 100 Continue; closing after the response");
+            self.state.disable_keep_alive();
         }
         if let Reading::Continue(decoder) = &mut self.state.reading {
             // skip sending the 100-continue
