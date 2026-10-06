@@ -1159,10 +1159,14 @@ impl Http1Transaction for Client {
                         let status = StatusCode::from_u16(res.code.expect("httparse completed"))?;
 
                         let reason = {
-                            let reason = res.reason.expect("httparse completed");
+                            let reason = match res.reason.expect("httparse completed") {
+                                // httparse reports a reason phrase with obs-text as empty.
+                                "" => raw_reason(bytes, &ctx.h1_parser_config),
+                                reason => reason.as_bytes(),
+                            };
                             // Only save the reason phrase if it isn't the canonical reason
-                            if Some(reason) != status.canonical_reason() {
-                                Some(Bytes::copy_from_slice(reason.as_bytes()))
+                            if Some(reason) != status.canonical_reason().map(str::as_bytes) {
+                                Some(Bytes::copy_from_slice(reason))
                             } else {
                                 None
                             }
@@ -1630,6 +1634,36 @@ impl Client {
         }
         buf[..unfolded.len()].copy_from_slice(&unfolded);
         idx.value.1 = idx.value.0 + unfolded.len();
+    }
+}
+
+/// The reason phrase of the status line httparse parsed from `bytes`, as its bytes: what
+/// follows `HTTP/1.x`, the status code and their delimiters, to the end of the line.
+#[cfg(feature = "client")]
+fn raw_reason<'a>(bytes: &'a [u8], config: &httparse::ParserConfig) -> &'a [u8] {
+    fn delimited(rest: &[u8], multiple_spaces: bool) -> &[u8] {
+        let spaces = if multiple_spaces {
+            rest.iter().take_while(|&&b| b == b' ').count()
+        } else {
+            1
+        };
+        rest.get(spaces..).unwrap_or(&[])
+    }
+    let multiple_spaces = config.multiple_spaces_in_response_status_delimiters_are_allowed();
+    // Past the empty lines httparse skips.
+    let start = bytes
+        .iter()
+        .position(|&b| b != b'\r' && b != b'\n')
+        .unwrap_or(bytes.len());
+    let line = &bytes[start..];
+    let line = &line[..line
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(line.len())];
+    let code = delimited(line.get(8..).unwrap_or(&[]), multiple_spaces);
+    match code.get(3..) {
+        Some(rest) if rest.first() == Some(&b' ') => delimited(rest, multiple_spaces),
+        _ => &[],
     }
 }
 
