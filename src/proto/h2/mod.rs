@@ -249,6 +249,10 @@ where
             // which can deadlock a second stream when talking to peers that
             // only emit WINDOW_UPDATE once their receive window is fully
             // exhausted. See #4003.
+            //
+            // No more body frames while 1,024 sent wait on the stream: those needing no
+            // capacity, as empty ones, are otherwise queued without bound.
+            ready!(me.body_tx.poll_queue_room(cx));
             match ready!(me.stream.as_mut().poll_frame(cx)) {
                 Some(Ok(frame)) => {
                     if frame.is_data() {
