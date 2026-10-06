@@ -71,6 +71,9 @@ enum Kind {
         ping: ping::Recorder,
         recv: h2::RecvStream,
         raw_trailers: Option<RawTrailers>,
+        // A request's, which a NO_ERROR reset cancels rather than ends: only a server stops
+        // an upload so, once it answered (RFC 9113 Section 8.1).
+        request: bool,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -159,6 +162,7 @@ impl Incoming {
         mut content_length: DecodedLength,
         ping: ping::Recorder,
         raw_trailers: Option<RawTrailers>,
+        request: bool,
     ) -> Self {
         // If the stream is already EOS, then the "unknown length" is clearly
         // actually ZERO.
@@ -172,6 +176,7 @@ impl Incoming {
             content_length,
             recv,
             raw_trailers,
+            request,
         })
     }
 
@@ -241,6 +246,7 @@ impl Body for Incoming {
                 recv: h2,
                 content_length: len,
                 raw_trailers,
+                request,
             } => {
                 if !*data_done {
                     match ready!(h2.poll_data(cx)) {
@@ -251,7 +257,7 @@ impl Body for Incoming {
                             return Poll::Ready(Some(Ok(Frame::data(bytes))));
                         }
                         Some(Err(e)) => {
-                            if let Some(h2::Reason::NO_ERROR) = e.reason() {
+                            if e.reason() == Some(h2::Reason::NO_ERROR) && !*request {
                                 // As mentioned in RFC 7540 Section 8.1, a RST_STREAM with NO_ERROR
                                 // indicates an early response, and should cause the body reading
                                 // to stop, but not fail it:
@@ -280,7 +286,7 @@ impl Body for Incoming {
                         Poll::Ready(Ok(t).transpose())
                     }
                     Err(e) => {
-                        if let Some(h2::Reason::NO_ERROR) = e.reason() {
+                        if e.reason() == Some(h2::Reason::NO_ERROR) && !*request {
                             // Same as above, a RST_STREAM with NO_ERROR indicates an early
                             // response, and should cause reading the trailers to stop, but
                             // not fail it:

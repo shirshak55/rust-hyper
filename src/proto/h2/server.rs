@@ -365,6 +365,7 @@ where
                                         content_length.into(),
                                         ping,
                                         raw_trailers,
+                                        true,
                                     ),
                                 ),
                                 None,
