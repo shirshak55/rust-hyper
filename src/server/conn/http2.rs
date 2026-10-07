@@ -368,7 +368,9 @@ impl<E> Builder<E> {
     /// many such requests run at once as
     /// [`max_concurrent_streams`](Self::max_concurrent_streams) allows (any number without
     /// it); those past it are dropped. Each request carries a
-    /// [`StreamReset`](crate::ext::StreamReset) telling the service of its reset.
+    /// [`StreamReset`](crate::ext::StreamReset) telling the service of its reset. So too the
+    /// requests whose client's connection ends, but for a reset, before their responses are
+    /// ready, those received just before it ended included.
     ///
     /// By default the service's future is dropped.
     pub fn serve_reset_requests(&mut self) -> &mut Self {

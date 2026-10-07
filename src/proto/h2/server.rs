@@ -480,6 +480,8 @@ pin_project! {
         reset_requests: Option<ResetRequests>,
         // Its client's reset, while the service runs on, which it tells the service.
         reset: Option<(ResetRequest, Reason)>,
+        // How its client's connection ended, but for a reset, while the service runs on.
+        ended: Option<h2::Error>,
         stream_reset: Option<crate::ext::StreamReset>,
     }
 }
@@ -536,6 +538,7 @@ where
             exec,
             reset_requests,
             reset: None,
+            ended: None,
             stream_reset,
         }
     }
@@ -737,17 +740,37 @@ where
                             let (_, reason) = me.reset.take().expect("the stream was reset");
                             return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
                         }
+                        // Nor once its connection ended.
+                        Poll::Ready(_) if me.ended.is_some() => {
+                            let ended = me.ended.take().expect("the connection ended");
+                            return Poll::Ready(Err(crate::Error::new_h2(ended)));
+                        }
                         Poll::Ready(Ok(r)) => r,
                         Poll::Pending => {
-                            if me.reset.is_some() {
+                            if me.reset.is_some() || me.ended.is_some() {
                                 return Poll::Pending;
                             }
                             send_informational(me.reply, me.informational, cx);
                             // Response is not yet ready, so we want to check if the client has sent a
                             // RST_STREAM frame which would cancel the current request.
-                            if let Poll::Ready(reason) =
-                                me.reply.poll_reset(cx).map_err(crate::Error::new_h2)?
-                            {
+                            let reset = match me.reply.poll_reset(cx) {
+                                // Its connection ended, but for a reset: the service runs on
+                                // too, so that the request the client sent before goes on.
+                                Poll::Ready(Err(e))
+                                    if me.reset_requests.is_some()
+                                        && matches!(
+                                            e.get_io().map(std::io::Error::kind),
+                                            Some(kind) if kind != std::io::ErrorKind::ConnectionReset
+                                        ) =>
+                                {
+                                    debug!("stream's connection ended: {}", e);
+                                    *me.ended = Some(e);
+                                    *me.informational = None;
+                                    return Poll::Pending;
+                                }
+                                reset => reset.map_err(crate::Error::new_h2)?,
+                            };
+                            if let Poll::Ready(reason) = reset {
                                 debug!("stream received RST_STREAM: {:?}", reason);
                                 match me.reset_requests.as_ref().and_then(ResetRequests::take) {
                                     Some(request) => {
