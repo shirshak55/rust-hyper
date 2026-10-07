@@ -273,7 +273,9 @@ impl Builder {
     /// Clients can chose to shutdown their write-side while waiting
     /// for the server to respond. Setting this to `true` will
     /// prevent closing the connection immediately if `read`
-    /// detects an EOF in the middle of a request.
+    /// detects an EOF in the middle of a request. So too if `read` fails,
+    /// but for a reset, once a request was read in full: it is still served,
+    /// its response then dropped and the connection ended with the failure.
     ///
     /// Default is `false`.
     pub fn half_close(&mut self, val: bool) -> &mut Self {

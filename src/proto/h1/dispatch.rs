@@ -389,6 +389,9 @@ where
                 #[cfg(feature = "server")]
                 self.write_informational(cx);
                 if let Some(msg) = ready!(Pin::new(&mut self.dispatch).poll_msg(cx)) {
+                    // Its connection failed while the request was served (see
+                    // `Conn::mid_message_detect_eof`): the response goes nowhere.
+                    self.conn.take_error()?;
                     let (head, body) = msg.map_err(crate::Error::new_user_service)?;
                     // Interim heads sent in the same poll that produced the final
                     // response must still go out first.

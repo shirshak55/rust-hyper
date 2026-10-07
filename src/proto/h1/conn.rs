@@ -582,7 +582,28 @@ where
             return Poll::Pending;
         }
 
-        let num_read = ready!(self.force_io_read(cx)).map_err(crate::Error::new_io)?;
+        let num_read = match ready!(self.io.poll_read_from_io(cx)) {
+            Ok(num_read) => num_read,
+            // A request read in full is still served when its client, which may half-close,
+            // fails the connection otherwise than by a reset: the failure ends the connection
+            // once the response comes, dropped (see `Dispatcher::poll_write`).
+            #[cfg(feature = "server")]
+            Err(e)
+                if self.state.half_closed.is_some()
+                    && matches!(self.state.writing, Writing::Init)
+                    && e.kind() != io::ErrorKind::ConnectionReset =>
+            {
+                trace!(error = %e, "client connection failed mid-message");
+                self.state.close_read();
+                self.state.error = Some(crate::Error::new_io(e));
+                return Poll::Pending;
+            }
+            Err(e) => {
+                trace!(error = %e, "force_io_read; io error");
+                self.state.close();
+                return Poll::Ready(Err(crate::Error::new_io(e)));
+            }
+        };
 
         if num_read == 0 {
             #[cfg(feature = "server")]
