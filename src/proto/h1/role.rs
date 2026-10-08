@@ -636,11 +636,10 @@ impl Server {
     ) -> crate::Result<Encoder> {
         struct OrigCaseWriter<'map> {
             map: &'map HeaderCaseMap,
-            // How many values of each name were written so far: the n-th written
-            // value of a name takes the n-th recorded spelling, which stays right
-            // when repeated names are interleaved (original order) rather than
-            // grouped.
-            written: HashMap<HeaderName, usize>,
+            // Each name's spellings not yet written: the n-th written value of a
+            // name takes the n-th recorded spelling, which stays right when
+            // repeated names are interleaved (original order) rather than grouped.
+            unwritten: HashMap<HeaderName, http::header::ValueIter<'map, Bytes>>,
             title_case_headers: bool,
         }
 
@@ -671,12 +670,14 @@ impl Server {
             fn write_header_name(&mut self, dst: &mut Vec<u8>, name: &HeaderName) {
                 let Self {
                     map,
-                    written,
+                    unwritten,
                     title_case_headers,
                 } = self;
-                let nth = written.entry(name.clone()).or_insert(0);
-                let orig_name = map.get_all_internal(name).nth(*nth);
-                *nth += 1;
+                let map = *map;
+                let orig_name = unwritten
+                    .entry(name.clone())
+                    .or_insert_with(|| map.get_all_internal(name))
+                    .next();
 
                 if let Some(orig_name) = orig_name {
                     extend(dst, orig_name);
@@ -690,7 +691,7 @@ impl Server {
 
         let header_name_writer = OrigCaseWriter {
             map: orig_headers,
-            written: HashMap::new(),
+            unwritten: HashMap::new(),
             title_case_headers: msg.title_case_headers,
         };
 
@@ -1856,8 +1857,16 @@ pub(super) fn write_message_headers(
 ) {
     let orig_case = extensions.get::<HeaderCaseMap>();
     if let Some(order) = extensions.get::<OriginalHeaderOrder>() {
+        let mut spellings = HashMap::new();
         for (name, nth, value) in order.entries(headers) {
-            match orig_case.and_then(|map| map.get_all(&name).nth(nth)) {
+            let spelled = orig_case.and_then(|map| {
+                spellings
+                    .entry(name.clone())
+                    .or_insert_with(|| map.get_all(&name).collect::<Vec<_>>())
+                    .get(nth)
+                    .copied()
+            });
+            match spelled {
                 Some(orig_name) => extend(dst, orig_name),
                 None if title_case_headers => title_case(dst, name.as_str().as_bytes()),
                 None => extend(dst, name.as_str().as_bytes()),
@@ -3371,6 +3380,70 @@ mod tests {
         super::write_headers_original_case(&headers, &orig_cases, &mut dst, false);
 
         assert_eq!(dst, b"X-Empty: a\r\nX-EMPTY: b\r\n");
+    }
+
+    #[test]
+    fn test_write_message_headers_spell_interleaved_repeats() {
+        let mut headers = HeaderMap::new();
+        let mut case = HeaderCaseMap::default();
+        let mut order = OriginalHeaderOrder::default();
+        for (spelling, value) in [("X-Rep", "1"), ("Other", "o"), ("x-REP", "2"), ("X-REP", "3")] {
+            let name = HeaderName::from_bytes(spelling.as_bytes()).unwrap();
+            headers.append(&name, value.parse().unwrap());
+            case.append(&name, Bytes::from(spelling));
+            order.append(name);
+        }
+        headers.append("x-rep", "4".parse().unwrap());
+        let mut extensions = http::Extensions::new();
+        extensions.insert(case);
+        extensions.insert(order);
+
+        let mut dst = Vec::new();
+        super::write_message_headers(&headers, &extensions, &mut dst, false);
+
+        assert_eq!(
+            dst,
+            b"X-Rep: 1\r\nOther: o\r\nx-REP: 2\r\nX-REP: 3\r\nx-rep: 4\r\n"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_server_response_encode_orig_case_interleaved_repeats() {
+        use crate::proto::BodyLength;
+
+        let mut head = MessageHead::default();
+        let mut case = HeaderCaseMap::default();
+        let mut order = OriginalHeaderOrder::default();
+        for (spelling, value) in [("X-Rep", "1"), ("Other", "o"), ("x-REP", "2"), ("X-REP", "3")] {
+            let name = HeaderName::from_bytes(spelling.as_bytes()).unwrap();
+            head.headers.append(&name, value.parse().unwrap());
+            case.append(&name, Bytes::from(spelling));
+            order.append(name);
+        }
+        head.extensions.insert(case);
+        head.extensions.insert(order);
+
+        let mut vec = Vec::new();
+        Server::encode(
+            Encode {
+                head: &mut head,
+                body: Some(BodyLength::Known(0)),
+                keep_alive: true,
+                req_method: &mut None,
+                title_case_headers: false,
+                date_header: false,
+                http10_peer: false,
+            },
+            &mut vec,
+        )
+        .unwrap();
+
+        assert_eq!(
+            &*vec,
+            b"HTTP/1.1 200 OK\r\nX-Rep: 1\r\nOther: o\r\nx-REP: 2\r\nX-REP: 3\r\ncontent-length: 0\r\n\r\n"
+                .as_ref(),
+        );
     }
 
     #[cfg(feature = "nightly")]
