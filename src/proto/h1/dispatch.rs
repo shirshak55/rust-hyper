@@ -702,8 +702,9 @@ cfg_server! {
             &mut self,
             cx: &mut Context<'_>,
         ) -> Poll<Option<MessageHead<http::StatusCode>>> {
-            let Some(rx) = self.informational.as_mut() else {
-                return Poll::Ready(None);
+            let rx = match self.informational.as_mut() {
+                Some(rx) => rx,
+                None => return Poll::Ready(None),
             };
             rx.poll_recv(cx).map(|res| {
                 res.map(|res| {

@@ -1,6 +1,5 @@
 use std::cell::RefCell;
-use std::fmt::{self, Write};
-use std::str;
+use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "http2")]
@@ -35,7 +34,6 @@ pub(crate) fn update_and_header_value() -> HeaderValue {
 
 struct CachedDate {
     bytes: [u8; DATE_VALUE_LENGTH],
-    pos: usize,
     #[cfg(feature = "http2")]
     header_value: HeaderValue,
     next_update: SystemTime,
@@ -47,7 +45,6 @@ impl CachedDate {
     fn new() -> Self {
         let mut cache = CachedDate {
             bytes: [0; DATE_VALUE_LENGTH],
-            pos: 0,
             #[cfg(feature = "http2")]
             header_value: HeaderValue::from_static(""),
             next_update: SystemTime::now(),
@@ -78,28 +75,14 @@ impl CachedDate {
     }
 
     fn render(&mut self, now: SystemTime) {
-        self.pos = 0;
-        let _ = write!(self, "{}", HttpDate::from(now));
-        debug_assert_eq!(self.pos, DATE_VALUE_LENGTH);
-        self.render_http2();
-    }
-
-    #[cfg(feature = "http2")]
-    fn render_http2(&mut self) {
-        self.header_value = HeaderValue::from_bytes(self.buffer())
-            .expect("Date format should be valid HeaderValue");
-    }
-
-    #[cfg(not(feature = "http2"))]
-    fn render_http2(&mut self) {}
-}
-
-impl fmt::Write for CachedDate {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let len = s.len();
-        self.bytes[self.pos..self.pos + len].copy_from_slice(s.as_bytes());
-        self.pos += len;
-        Ok(())
+        let mut dst = &mut self.bytes[..];
+        write!(dst, "{}", HttpDate::from(now)).expect("Date should fit in buffer");
+        debug_assert!(dst.is_empty());
+        #[cfg(feature = "http2")]
+        {
+            self.header_value = HeaderValue::from_bytes(self.buffer())
+                .expect("Date format should be valid HeaderValue");
+        }
     }
 }
 
